@@ -728,3 +728,7 @@ td.warn { color: var(--warn); }
 .fal-dir label:has(input:checked) { background: var(--gold-soft); color: var(--gold); }
 .fal-dir input { accent-color: var(--gold); margin: 0; width: auto; }
 .fal-seg { display: flex; flex-direction: column; align-items: flex-start; gap: 2px; text-align: left; height: auto; padding-block: 10px; }
+.mv-body { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+.mv-head { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+.mv-foot { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; justify-content: space-between; }
+.mv-checks { display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: 8px 16px; margin-top: 8px; max-height: 320px; overflow: auto; padding: 10px; border: 1px solid var(--line); border-radius: 10px; }

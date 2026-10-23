@@ -2600,66 +2600,81 @@
     return { ok, score: (mrz?.score || 0) + (V.count || 0), fields: f, pobAuto: !!V.pob };
   }
 
-  // ---- Mouvements de passagers (embarquements / débarquements) et trajets
+  // ---- Mouvements de passagers : chaque « Embark » / « Disembark » est enregistré (folder 'guest_moves') avec
+  // sa date, son port et les passagers cochés. Les passagers à bord se déduisent en rejouant les mouvements dans l'ordre.
   const isFR = s => /^\s*(fr|fra|france)\b/i.test(String(s || ''));
   const portKey = p => `${p.date || ''}|${String(p.port || '').trim().toLowerCase()}`;
-  function guestMoves(c, g, M = guestMeta(c)) {
-    return {
-      emb: { date: g.emb_date || c.start_date || '', port: g.emb_port || g.port_emb || M.port_emb || '', country: g.emb_country || M.emb_country || '' },
-      dis: { date: g.dis_date || c.end_date || c.start_date || '', port: g.dis_port || g.port_dis || M.port_dis || '', country: g.dis_country || M.dis_country || '' },
-    };
+  const movesOf = c => (S.charter_documents || []).filter(d => d.charter_id === c.id && d.folder === 'guest_moves')
+    .map(d => ({ d, m: parseNote(d) }))
+    .sort((a, b) => String(a.m.date || '').localeCompare(String(b.m.date || '')) || String(a.d.created_at || '').localeCompare(String(b.d.created_at || '')));
+  // État du bord après chaque mouvement : ids à bord, et pour chacun le port où il est monté
+  function boardHistory(c) {
+    const G = guestsOf(c), byId = new Map(G.map(x => [x.d.id, x])), on = new Map(), steps = [];
+    for (const mv of movesOf(c)) {
+      const ids = (mv.m.guests || []).filter(id => byId.has(id));
+      if (mv.m.type === 'disembark') ids.forEach(id => on.delete(id)); else ids.forEach(id => { if (!on.has(id)) on.set(id, mv.m); });
+      steps.push({ ...mv, ids, aboard: [...on.keys()].map(id => byId.get(id)), embAt: new Map(on) });
+    }
+    return { G, byId, steps };
   }
-  // Liste ordonnée des escales où des passagers montent ou descendent, et passagers à bord après chacune
-  function voyageOf(c) {
-    const M = guestMeta(c), G = guestsOf(c), map = new Map();
-    // Une escale de débarquement identique à celle d'embarquement (même jour, même port : day charter, aller-retour,
-    // charter sans date de fin) reste une escale distincte, placée après.
-    const add = (pt, kind, x, avoid) => { let k = portKey(pt); if (kind === 'dis' && (k === avoid || k === startKey)) k += '|end';
-      let m = map.get(k); if (!m) map.set(k, m = { ...pt, key: k, emb: [], dis: [], end: k.endsWith('|end') }); if (x) m[kind].push(x); return k; };
-    const startKey = portKey({ date: c.start_date || '', port: M.port_emb });
-    add({ date: c.start_date || '', port: M.port_emb, country: M.emb_country }, 'emb');
-    G.forEach(x => { const mv = guestMoves(c, x.g, M); x.embKey = add(mv.emb, 'emb', x); x.disKey = add(mv.dis, 'dis', x, x.embKey); });
-    add({ date: c.end_date || c.start_date || '', port: M.port_dis, country: M.dis_country }, 'dis');
-    const stops = [...map.values()].sort((a, b) => String(a.date).localeCompare(String(b.date)) || (a.end ? 1 : 0) - (b.end ? 1 : 0)
-      || (b.emb.length ? 1 : 0) - (a.emb.length ? 1 : 0));
-    const idx = new Map(stops.map((s, i) => [s.key, i]));
-    G.forEach(x => { x.ei = idx.get(x.embKey); x.di = idx.get(x.disKey); });
-    const onBoardAfter = i => G.filter(x => x.ei <= i && x.di > i);
-    return { M, G, stops, onBoardAfter };
+  // Passagers à bord à une date donnée (mouvements du même jour inclus), en ignorant éventuellement un mouvement
+  function aboardAt(c, date, skipId) {
+    const G = guestsOf(c), ok = new Set(G.map(x => x.d.id)), on = new Set();
+    for (const mv of movesOf(c)) { if (mv.d.id === skipId || String(mv.m.date || '') > String(date || '')) continue;
+      (mv.m.guests || []).filter(id => ok.has(id)).forEach(id => mv.m.type === 'disembark' ? on.delete(id) : on.add(id)); }
+    return G.filter(x => on.has(x.d.id));
+  }
+  // Où et quand chaque passager monte / descend (pour les colonnes 15 et 17 de la FAL 6)
+  function guestTimeline(c) {
+    const M = guestMeta(c), t = new Map();
+    for (const { m } of movesOf(c)) (m.guests || []).forEach(id => {
+      const e = t.get(id) || {}; if (m.type === 'disembark') e.dis = m; else if (!e.emb || e.dis) { e.emb = m; e.dis = null; } t.set(id, e); });
+    return id => { const e = t.get(id) || {}; return { emb: e.emb || null, dis: e.dis || { date: c.end_date, port: M.port_dis, country: M.dis_country, planned: true } }; };
   }
   // Trajets au sens des douanes : un contrat = un trajet, sauf si des passagers montent ou descendent définitivement en escale
   function trajetsOf(c) {
-    const V = voyageOf(c), out = [];
-    if (!V.G.length) {
-      const a = V.stops[0], b = V.stops[V.stops.length - 1];
-      return [{ c, from: a, to: b, pax: null, key: `${c.id}|${a.key}|${b.key}` }];
+    const M = guestMeta(c), H = boardHistory(c);
+    const endStop = { date: c.end_date || c.start_date || '', port: M.port_dis, country: M.dis_country };
+    if (!H.steps.length) {
+      const a = { date: c.start_date || '', port: M.port_emb, country: M.emb_country };
+      return [{ c, from: { ...a, key: portKey(a) }, to: { ...endStop, key: portKey(endStop) }, pax: null, key: `${c.id}|${portKey(a)}|${portKey(endStop)}` }];
     }
-    for (let i = 0; i < V.stops.length - 1; i++) {
-      const pax = V.onBoardAfter(i).length; if (!pax) continue;
-      const from = V.stops[i], to = V.stops[i + 1];
-      out.push({ c, from, to, pax, key: `${c.id}|${from.key}|${to.key}` });
-    }
+    const stops = []; // mouvements du même jour au même port = une seule escale
+    H.steps.forEach(st => { const k = portKey(st.m), last = stops[stops.length - 1];
+      if (last && last.key === k) last.aboard = st.aboard; else stops.push({ date: st.m.date, port: st.m.port, country: st.m.country, key: k, aboard: st.aboard }); });
+    const out = [];
+    stops.forEach((s, i) => {
+      if (!s.aboard.length) return;
+      const to = stops[i + 1] || { ...endStop, key: portKey(endStop) + '|end' };
+      out.push({ c, from: s, to, pax: s.aboard.length, key: `${c.id}|${s.key}|${to.key}` });
+    });
     return out;
   }
   const trajetAuto = t => !!(t.from.country && !isFR(t.from.country)) || !!(t.to.country && !isFR(t.to.country));
   const trajetOut = t => { const f = (PROFILE.vat_flags || {})[t.key]; return f === true || f === false ? f : trajetAuto(t); };
   const stopLabel = p => `${esc(p.port || '—')}${p.country ? ` <small class="muted">(${esc(p.country)})</small>` : ''}`;
+  const gName = x => [x.g.family, x.g.given].filter(Boolean).join(' ') || x.d.title || '?';
 
   // ---- Page « Guest List »
   function viewGuestList(c) {
-    const V = voyageOf(c), M = V.M, list = V.G, P = PROFILE;
+    const M = guestMeta(c), H = boardHistory(c), list = H.G, P = PROFILE, TL = guestTimeline(c);
     const missingTable = (S._missing || []).includes('charter_documents');
     const toCheck = list.filter(({ g }) => !g.checked && !g.mrz_ok).length;
     const incomplete = list.filter(({ g }) => guestMissing(g).length).length;
     const pobCheck = list.filter(({ g }) => g.pob_auto && !g.checked).length;
     const shipInfo = [['Nom', BOAT?.name || YACHT], ['IMO', P.imo], ['Call sign', P.call_sign], ['Pavillon', P.flag_state]];
     const shipMissing = shipInfo.filter(([, v]) => !v).map(([l]) => l);
+    const lastAboard = new Set(H.steps.length ? H.steps[H.steps.length - 1].aboard.map(x => x.d.id) : []);
+    const lists = (S.charter_documents || []).filter(d => d.charter_id === c.id && d.folder === 'guest_lists');
     const row = (x, i) => {
-      const { d, g } = x, miss = guestMissing(g), ex = expiryState(g, c), mv = guestMoves(c, g, M);
+      const { d, g } = x, miss = guestMissing(g), ex = expiryState(g, c), tl = TL(d.id);
       const state = (g.checked ? '<span class="badge badge-ok">Vérifié</span>'
         : g.mrz_ok ? '<span class="badge badge-ok">Lu ✓</span>'
         : '<span class="chip chip-warn" title="Lecture incertaine : comparez avec le passeport">À vérifier</span>')
         + (miss.length ? `<br><small class="muted">à compléter : ${esc(miss.join(', '))}</small>` : '');
+      const board = lastAboard.has(d.id) ? `<span class="badge badge-ok">À bord</span><br><small class="muted">depuis le ${fdate(tl.emb?.date).slice(0, 5)} ${esc(tl.emb?.port || '')}</small>`
+        : tl.emb ? `<span class="badge badge-open">Débarqué</span><br><small class="muted">le ${fdate(tl.dis?.date).slice(0, 5)} ${esc(tl.dis?.port || '')}</small>`
+        : '<small class="muted">pas encore embarqué</small>';
       return `<tr>
         <td data-label="N°"><div>${i + 1}</div></td>
         <td data-label="Nom"><div><b>${esc(g.family || '—')}</b> ${esc(g.given || '')}</div></td>
@@ -2667,22 +2682,27 @@
         <td data-label="Naissance"><div>${fdate(g.dob)}${g.pob ? `<br><small class="muted">${esc(g.pob)}</small>` : ''}${g.pob_auto && !g.checked ? '<br><span class="chip chip-warn" title="Lieu de naissance lu automatiquement sur la page : vérifiez-le">lieu à vérifier</span>' : ''}</div></td>
         <td data-label="Document"><div>${esc(g.doc_no || '')}<br><small class="muted">${esc(g.doc_type || '')}${g.issuing ? ' · ' + esc(g.issuing) : ''}</small></div></td>
         <td data-label="Expiration" class="${ex === 'bad' ? 'neg' : ex === 'warn' ? 'warn' : ''}"><div>${fdate(g.expiry)}${ex === 'bad' ? '<br><small>expiré pendant le charter</small>' : ex === 'warn' ? '<br><small>moins de 6 mois</small>' : ''}</div></td>
-        <td data-label="À bord"><div>${fdate(mv.emb.date).slice(0, 5)} ${esc(mv.emb.port || '')}<br><small class="muted">→ ${fdate(mv.dis.date).slice(0, 5)} ${esc(mv.dis.port || '')}</small></div></td>
+        <td data-label="À bord"><div>${board}</div></td>
         <td data-label="État"><div>${state}</div></td>
         <td class="actions"><div class="row-gap" style="justify-content:flex-end">
           ${d.file_path ? `<button class="icon-btn" data-act="guest-file" data-id="${d.id}" title="Voir le passeport">${ICON.eye}</button>` : ''}
           <button class="icon-btn" data-act="guest-edit" data-id="${d.id}" title="Modifier">${ICON.edit}</button>
           <button class="icon-btn danger" data-act="guest-del" data-id="${d.id}" title="Supprimer">${ICON.trash}</button></div></td></tr>`;
     };
-    const trajets = trajetsOf(c);
-    const stopRow = (s, i) => {
-      const after = V.onBoardAfter(i).length;
-      const names = arr => arr.map(x => esc([x.g.family, x.g.given].filter(Boolean).join(' '))).join(', ');
-      return `<div class="mv-stop"><div class="mv-dot ${s.emb.length ? 'in' : ''}${s.dis.length ? ' out' : ''}"></div><div>
-        <b>${fdate(s.date)} · ${stopLabel(s)}</b>
-        ${s.emb.length ? `<div class="small"><span class="badge badge-ok">Embark ${s.emb.length}</span> ${names(s.emb)}</div>` : ''}
-        ${s.dis.length ? `<div class="small"><span class="badge badge-open">Disembark ${s.dis.length}</span> ${names(s.dis)}</div>` : ''}
-        ${list.length && i < V.stops.length - 1 ? `<div class="muted small">${after} passager${after > 1 ? 's' : ''} à bord ensuite</div>` : ''}</div></div>`;
+    const moveRow = (st, i) => {
+      const isDis = st.m.type === 'disembark', names = st.ids.map(id => esc(gName(H.byId.get(id)))).join(', ');
+      const saved = lists.filter(l => parseNote(l).move_id === st.d.id).sort((a, b) => String(b.created_at || '').localeCompare(String(a.created_at || '')))[0];
+      return `<div class="mv-stop"><div class="mv-dot ${isDis ? 'out' : 'in'}"></div><div class="mv-body">
+        <div class="mv-head"><b>${fdate(st.m.date)} · ${stopLabel(st.m)}</b>
+          <span class="badge ${isDis ? 'badge-open' : 'badge-ok'}">${isDis ? 'Disembark' : 'Embark'} ${st.ids.length}</span></div>
+        <div class="small">${names || '<span class="muted">aucun passager</span>'}</div>
+        <div class="mv-foot"><span class="muted small"><b>${st.aboard.length}</b> passager${st.aboard.length > 1 ? 's' : ''} à bord ensuite</span>
+          <span class="row-gap wrap">
+            ${saved?.file_path ? `<button class="btn btn-ghost btn-xs" data-act="guest-file" data-id="${saved.id}">${ICON.eye}Guest List</button>` : ''}
+            <button class="btn btn-ghost btn-xs" data-act="move-list" data-id="${st.d.id}" data-kind="pdf" ${st.aboard.length ? '' : 'disabled'}>${ICON.file}PDF</button>
+            <button class="btn btn-ghost btn-xs" data-act="move-list" data-id="${st.d.id}" data-kind="xlsx" ${st.aboard.length ? '' : 'disabled'}>${ICON.sheet}Excel</button>
+            <button class="icon-btn" data-act="guest-move" data-id="${st.d.id}" title="Modifier">${ICON.edit}</button>
+            ${i === H.steps.length - 1 ? `<button class="icon-btn danger" data-act="move-del" data-id="${st.d.id}" title="Supprimer">${ICON.trash}</button>` : ''}</span></div></div></div>`;
     };
     $('#app').innerHTML = shell('charters', `
       <a class="back" href="#/charters">${ICON.back}Charters</a>
@@ -2690,55 +2710,48 @@
         <div><div class="eyebrow">${esc(c.yacht || YACHT)}</div><h1>${esc(c.title)}</h1>
           <p class="muted">${esc(c.client_name || '')}${c.client_name ? ' · ' : ''}${fdate(c.start_date)} → ${fdate(c.end_date)} · ${statusBadge(c)}</p></div>
         <div class="head-actions">
-          <button class="btn btn-ghost" data-act="fal6-xlsx" ${list.length ? '' : 'disabled'}>${ICON.sheet}Excel</button>
-          <button class="btn btn-gold" data-act="fal6-pdf" ${list.length ? '' : 'disabled'}>${ICON.file}FAL 6 (PDF)</button></div>
+          <button class="btn btn-ghost" data-act="guest-move" data-type="disembark" ${lastAboard.size ? '' : 'disabled'}>Disembark</button>
+          <button class="btn btn-gold" data-act="guest-move" data-type="embark" ${list.length ? '' : 'disabled'}>Embark</button></div>
       </div>
       ${folderTabs(c, 'guests')}
       ${missingTable ? `<div class="banner banner-gold">${ICON.lock}<div>Pour utiliser ce dossier, exécutez une fois le fichier <b>maj-dossiers.sql</b> dans Supabase (SQL Editor), puis rechargez la page.</div></div>` : ''}
       <section class="panel">
-        <div class="panel-head"><h2>Passagers${list.length ? ` (${list.length})` : ''}</h2>
+        <div class="panel-head"><h2>1. Passeports${list.length ? ` (${list.length})` : ''}</h2>
           <div class="row-gap wrap">
             <button class="btn btn-ghost btn-sm" data-act="guest-edit">${ICON.plus}Ajouter à la main</button>
             <label class="btn btn-primary btn-sm file-btn">${ICON.plus}Ajouter des passeports<input type="file" multiple class="sr-file" id="guest-upload" accept="image/*,application/pdf,.heic"></label></div></div>
-        <p class="muted small">Photo ou PDF de la page d’identité, un fichier par passager. La bande du bas (MRZ) est lue automatiquement dans le téléphone : nom, nationalité, date de naissance, sexe, n° et expiration. Le <b>lieu de naissance</b> n’y figure pas : complétez-le. Les scans sont rangés dans un espace privé (capitaine et équipage) et n’apparaissent jamais dans la vue client.</p>
+        <p class="muted small">Ajoutez les passeports de tous les passagers du charter (photo ou PDF, un fichier par personne) : la bande du bas est lue automatiquement. Ensuite, <b>Embark</b> pour faire monter les passagers et éditer la Guest List. Les scans restent dans un espace privé (capitaine et équipage), jamais dans la vue client.</p>
         <div id="guest-progress" class="banner banner-info" hidden></div>
-        ${toCheck || incomplete || pobCheck ? `<div class="banner banner-gold">${ICON.eye}<div>${toCheck ? `<b>${toCheck} passager${toCheck > 1 ? 's' : ''} à vérifier</b> : lecture incertaine, comparez la fiche avec le passeport. ` : ''}${incomplete ? `<b>${incomplete} fiche${incomplete > 1 ? 's' : ''} à compléter</b> (le lieu de naissance n’est pas dans la bande MRZ). ` : ''}${pobCheck ? `<b>${pobCheck} lieu${pobCheck > 1 ? 'x' : ''} de naissance lu${pobCheck > 1 ? 's' : ''} automatiquement</b> : vérifiez-le${pobCheck > 1 ? 's' : ''} sur la fiche, puis cochez « J’ai vérifié ».` : ''}</div></div>` : ''}
+        ${toCheck || incomplete || pobCheck ? `<div class="banner banner-gold">${ICON.eye}<div>${toCheck ? `<b>${toCheck} passager${toCheck > 1 ? 's' : ''} à vérifier</b> : lecture incertaine, comparez la fiche avec le passeport. ` : ''}${incomplete ? `<b>${incomplete} fiche${incomplete > 1 ? 's' : ''} à compléter</b>. ` : ''}${pobCheck ? `<b>${pobCheck} lieu${pobCheck > 1 ? 'x' : ''} de naissance lu${pobCheck > 1 ? 's' : ''} automatiquement</b> : vérifiez puis cochez « J’ai vérifié ».` : ''}</div></div>` : ''}
         ${list.length ? `<div class="table-wrap"><table class="table table-cards table-compact"><thead><tr><th>N°</th><th>Nom</th><th>Nationalité</th><th>Naissance</th><th>Document</th><th>Expiration</th><th>À bord</th><th>État</th><th></th></tr></thead>
           <tbody>${list.map(row).join('')}</tbody></table></div>`
-          : `<div class="empty-state"><p class="muted">Aucun passager. Ajoutez les photos des passeports : la liste se remplit toute seule.</p></div>`}
+          : `<div class="empty-state"><p class="muted">Aucun passeport. Ajoutez les photos des passeports : les fiches se remplissent toutes seules.</p></div>`}
       </section>
       <section class="panel">
-        <div class="panel-head"><h2>Embarquements & débarquements</h2>
+        <div class="panel-head"><h2>2. Embark / Disembark</h2>
           <div class="row-gap wrap">
-            <button class="btn btn-ghost btn-sm" data-act="guest-disembark" ${list.length ? '' : 'disabled'}>Disembark</button>
-            <button class="btn btn-primary btn-sm" data-act="guest-embark">Embark</button></div></div>
-        <p class="muted small">Un passager qui monte ou descend définitivement pendant le charter crée une nouvelle escale : la Guest List (FAL 6) peut alors être éditée pour chaque départ et chaque arrivée, et le charter compte plusieurs trajets dans l’onglet <a href="#/vat">VAT Exo FR</a>.</p>
-        <div class="mv-list">${V.stops.map(stopRow).join('')}</div>
-        <p class="small"><span class="muted">Trajets douane pour ce charter :</span> <b>${trajets.length}</b>${trajets.length ? ' — ' + trajets.map(t => `${esc(t.from.port || '?')} → ${esc(t.to.port || '?')} ${trajetOut(t) ? '<span class="badge badge-ok">hors eaux FR</span>' : '<span class="badge badge-open">eaux FR</span>'}`).join(' · ') : ''}</p>
+            <button class="btn btn-ghost btn-sm" data-act="guest-move" data-type="disembark" ${lastAboard.size ? '' : 'disabled'}>Disembark</button>
+            <button class="btn btn-primary btn-sm" data-act="guest-move" data-type="embark" ${list.length ? '' : 'disabled'}>Embark</button></div></div>
+        <p class="muted small">À chaque embarquement ou débarquement : cochez les passagers, indiquez la date et le lieu, validez. Une nouvelle Guest List (FAL 6) est éditée avec <b>tous les passagers à bord</b> à ce moment-là, et gardée ici. Chaque escale avec mouvement compte aussi comme un nouveau trajet dans <a href="#/vat">VAT Exo FR</a>.</p>
+        ${H.steps.length ? `<div class="mv-list">${H.steps.map(moveRow).join('')}</div>`
+          : `<div class="empty-state"><p class="muted">${list.length ? 'Faites <b>Embark</b> pour l’embarquement du début de charter : la première Guest List sera éditée.' : 'Ajoutez d’abord les passeports.'}</p></div>`}
       </section>
-      ${(() => { const L = (S.charter_documents || []).filter(d => d.charter_id === c.id && d.folder === 'guest_lists')
-          .sort((a, b) => String(b.created_at || '').localeCompare(String(a.created_at || '')));
-        return `<section class="panel">
-        <div class="panel-head"><h2>Listes éditées${L.length ? ` (${L.length})` : ''}</h2>
-          <div class="row-gap wrap"><button class="btn btn-ghost btn-sm" data-act="fal6-xlsx" ${list.length ? '' : 'disabled'}>${ICON.sheet}Excel</button>
-          <button class="btn btn-primary btn-sm" data-act="fal6-pdf" ${list.length ? '' : 'disabled'}>${ICON.file}Éditer une FAL 6</button></div></div>
-        <p class="muted small">Chaque Passenger List éditée (PDF ou Excel) est gardée ici, avec la date d’édition et les passagers qu’elle contient.</p>
-        ${L.length ? `<div class="doc-list">${L.map(d => { const n = parseNote(d); return `<div class="doc-item"><div class="doc-ico">${n.kind === 'Excel' ? ICON.sheet : ICON.file}</div><div class="doc-main">
-            <b>${esc(d.title || d.file_name || 'Passenger List')}</b> <span class="badge ${n.direction === 'arrival' ? 'badge-open' : 'badge-ok'}">${esc(n.kind || 'PDF')} · ${n.pax ?? '?'} pax</span>
+      ${lists.length ? `<section class="panel">
+        <div class="panel-head"><h2>Guest Lists éditées (${lists.length})</h2></div>
+        <div class="doc-list">${lists.sort((a, b) => String(b.created_at || '').localeCompare(String(a.created_at || ''))).map(d => { const n = parseNote(d); return `<div class="doc-item"><div class="doc-ico">${n.kind === 'Excel' ? ICON.sheet : ICON.file}</div><div class="doc-main">
+            <b>${esc(d.title || d.file_name || 'Passenger List')}</b> <span class="badge badge-ok">${esc(n.kind || 'PDF')} · ${n.pax ?? '?'} pax</span>
             <small class="muted">éditée le ${fdatetime(d.created_at)}${n.names?.length ? ' · ' + esc(n.names.join(', ')) : ''}</small></div>
             <div class="row-gap">${d.file_path ? `<button class="icon-btn" data-act="guest-file" data-id="${d.id}" title="Ouvrir / télécharger">${ICON.eye}</button>` : ''}
-            <button class="icon-btn danger" data-act="gl-del" data-id="${d.id}" title="Supprimer">${ICON.trash}</button></div></div>`; }).join('')}</div>`
-          : '<div class="empty-state"><p class="muted">Aucune liste éditée pour l’instant.</p></div>'}
-      </section>`; })()}
+            <button class="icon-btn danger" data-act="gl-del" data-id="${d.id}" title="Supprimer">${ICON.trash}</button></div></div>`; }).join('')}</div>
+      </section>` : ''}
       <section class="panel">
         <div class="panel-head"><h2>Formulaire FAL 6</h2></div>
-        <p class="muted small">Embarquement et débarquement prévus pour tous les passagers (aux dates du charter), sauf ceux que vous faites monter ou descendre en cours de route.</p>
         ${shipMissing.length ? `<div class="banner banner-gold">${ICON.anchor}<div>À compléter dans <a href="#/settings">Paramètres</a> : ${shipMissing.join(', ')} du bateau.</div></div>` : ''}
         <p class="small">${shipInfo.map(([l, v]) => `<span class="muted">${l} :</span> <b>${esc(v || '—')}</b>`).join(' &nbsp;·&nbsp; ')}</p>
         <form id="f-fal" class="form-grid">
-          <label class="field"><span>15. Port d’embarquement · ${fdate(c.start_date)}</span><input name="port_emb" value="${esc(M.port_emb)}" placeholder="ex. Cannes"></label>
+          <label class="field"><span>Port d’embarquement prévu · ${fdate(c.start_date)}</span><input name="port_emb" value="${esc(M.port_emb)}" placeholder="ex. Cannes"></label>
           <label class="field"><span>Pays</span><input name="emb_country" list="dl-countries" value="${esc(M.emb_country)}"></label>
-          <label class="field"><span>17. Port de débarquement · ${fdate(c.end_date)}</span><input name="port_dis" value="${esc(M.port_dis)}" placeholder="ex. Monaco"></label>
+          <label class="field"><span>17. Port de débarquement prévu · ${fdate(c.end_date)}</span><input name="port_dis" value="${esc(M.port_dis)}" placeholder="ex. Monaco"></label>
           <label class="field"><span>Pays</span><input name="dis_country" list="dl-countries" value="${esc(M.dis_country)}"></label>
           <label class="field"><span>1.4 N° de voyage</span><input name="voyage" value="${esc(M.voyage)}" placeholder="facultatif"></label>
           <label class="field"><span>19. Signataire (capitaine, agent ou officier)</span><input name="master" value="${esc(M.master)}" placeholder="ex. Capt. Grégoire Duflos"></label>
@@ -2748,7 +2761,7 @@
       </section>
       ${list.some(({ d }) => d.file_path) ? `<section class="panel">
         <div class="panel-head"><h2>Données personnelles</h2><button class="btn btn-ghost btn-sm" data-act="guest-purge">${ICON.trash}Effacer les scans</button></div>
-        <p class="muted small">Après le charter, effacez les scans des passeports : la liste des passagers et le formulaire FAL 6 restent disponibles.</p></section>` : ''}`);
+        <p class="muted small">Après le charter, effacez les scans des passeports : les fiches et les Guest Lists éditées restent disponibles.</p></section>` : ''}`);
 
     const f = $('#f-fal');
     f.addEventListener('submit', async e => {
@@ -2760,12 +2773,12 @@
       catch (err) { toast(errMsg(err), 'err'); busy(btn, false); }
     });
     const inp = $('#guest-upload');
-    inp.addEventListener('change', () => addPassports(c, [...inp.files], null, $('#guest-progress')));
+    inp.addEventListener('change', () => addPassports(c, [...inp.files], $('#guest-progress')));
   }
   const countryDatalist = () => $('#dl-countries') ? '' : `<datalist id="dl-countries">${COUNTRY_NAMES.map(n => `<option value="${esc(n)}">`).join('')}</datalist>`;
 
-  // Lit et enregistre une série de passeports (emb = embarquement en cours de charter, sinon embarquement initial)
-  async function addPassports(c, files, emb, box) {
+  // Lit et enregistre une série de passeports
+  async function addPassports(c, files, box) {
     if (!files.length) return;
     if (box) box.hidden = false;
     let order = Math.max(0, ...guestsOf(c).map(x => x.g.order ?? 0)) + 1, ok = 0, unsure = 0, dup = 0;
@@ -2773,14 +2786,14 @@
     for (let k = 0; k < files.length; k++) {
       const file = files[k];
       const say = s => { if (box) box.innerHTML = `<span class="spinner spinner-sm"></span><div>Passeport ${k + 1}/${files.length} — ${esc(file.name)} : ${s}</div>`; };
-      say('lecture de la bande MRZ…');
+      say('lecture…');
       let r = null;
-      try { r = await readPassport(file, n => say(`lecture de la bande MRZ (essai ${n})…`)); } catch (e) { console.warn(e); }
+      try { r = await readPassport(file, n => say(`lecture (étape ${n})…`)); } catch (e) { console.warn(e); }
       if (r?.fields.doc_no && known.has(r.fields.doc_no)) { dup++; continue; }
       try {
         say('enregistrement…');
         const up = await api.uploadPrivate(file, `passports/${c.id}`);
-        const g = { ...(r ? r.fields : {}), mrz_ok: !!r?.ok, pob_auto: !!(r?.pobAuto && r.fields.pob), order: order++, ...(emb || {}) };
+        const g = { ...(r ? r.fields : {}), mrz_ok: !!r?.ok, pob_auto: !!(r?.pobAuto && r.fields.pob), order: order++ };
         await api.insert('charter_documents', { charter_id: c.id, folder: 'guests', title: [g.family, g.given].filter(Boolean).join(' ') || file.name, note: JSON.stringify(g), ...up });
         if (g.doc_no) known.add(g.doc_no);
         ok++; if (!r?.ok) unsure++;
@@ -2791,47 +2804,82 @@
     if (dup) toast(`${dup} passeport${dup > 1 ? 's' : ''} déjà dans la liste`, 'err');
   }
   const clampDate = (d, c) => { if (c.start_date && d < c.start_date) return c.start_date; if (c.end_date && d > c.end_date) return c.end_date; return d; };
-  const stopFields = (p, c, label) => `
-    <label class="field"><span>Date</span><input type="date" name="date" required value="${esc(p.date || '')}" min="${esc(c.start_date || '')}" max="${esc(c.end_date || '')}"></label>
-    <label class="field"><span>Port ou mouillage ${label}</span><input name="port" required value="${esc(p.port || '')}" placeholder="ex. Portofino"></label>
-    <label class="field"><span>Pays</span><input name="country" required list="dl-countries" value="${esc(p.country || '')}" placeholder="ex. Italy"></label>`;
-  ACTIONS['guest-embark'] = () => {
-    const c = charterById(CURRENT), M = guestMeta(c);
-    const m = openModal({ title: 'Embark — passagers qui montent à bord', wide: true,
-      body: `<form class="form-grid" id="f-emb">${stopFields({ date: clampDate(today(), c), country: M.dis_country || M.emb_country }, c, 'd’embarquement')}
-        <label class="field span-2"><span>Passeports des nouveaux passagers <small>(photo ou PDF, un par passager)</small></span><input type="file" name="files" multiple accept="image/*,application/pdf,.heic"></label>
-        <p class="muted small span-2">Sans passeport, les passagers s’ajoutent ensuite un par un avec « Ajouter à la main ».</p></form>${countryDatalist()}
-        <div id="emb-progress" class="banner banner-info" hidden></div>`,
-      footer: `<button class="btn btn-ghost" data-close>Annuler</button><button class="btn btn-primary" data-ok>Embark</button>` });
-    $('[data-ok]', m).onclick = async ev => {
-      const f = $('#f-emb', m); if (!f.reportValidity()) return; busy(ev.currentTarget, true);
-      const emb = { emb_date: f.date.value, emb_port: f.port.value.trim(), emb_country: f.country.value.trim() };
-      const files = [...f.files.files];
-      if (files.length) { await addPassports(c, files, emb, $('#emb-progress', m)); closeModal(); }
-      else { closeModal(); guestModal(c, null, emb); }
+
+  // ---- Fenêtre Embark / Disembark : on coche les passagers, date et lieu, puis la Guest List est éditée
+  ACTIONS['guest-move'] = b => {
+    const c = charterById(CURRENT), M = guestMeta(c), G = guestsOf(c), moves = movesOf(c);
+    const cur = b.dataset.id ? moves.find(x => x.d.id === b.dataset.id) : null;
+    const type = cur ? cur.m.type : (b.dataset.type || 'embark');
+    const first = !moves.length;
+    const lastMove = moves[moves.length - 1]?.m;
+    const date0 = cur ? cur.m.date : first ? (c.start_date || today()) : clampDate(today(), c);
+    const port0 = cur ? cur.m.port : first ? M.port_emb : '';
+    const country0 = cur ? cur.m.country : first ? M.emb_country : (lastMove?.country || M.emb_country || '');
+    const m = openModal({ title: `${type === 'disembark' ? 'Disembark — passagers qui quittent le bord' : 'Embark — passagers qui montent à bord'}`, wide: true,
+      body: `<form class="form-grid" id="f-move">
+          <div class="seg fal-dir span-2" role="radiogroup" aria-label="Mouvement">
+            <label><input type="radio" name="type" value="embark" ${type !== 'disembark' ? 'checked' : ''}> <span>Embark</span></label>
+            <label><input type="radio" name="type" value="disembark" ${type === 'disembark' ? 'checked' : ''}> <span>Disembark</span></label></div>
+          <label class="field"><span>Date</span><input type="date" name="date" required value="${esc(date0 || '')}"></label>
+          <label class="field"><span>Port ou mouillage</span><input name="port" required value="${esc(port0 || '')}" placeholder="ex. Cannes"></label>
+          <label class="field"><span>Pays</span><input name="country" required list="dl-countries" value="${esc(country0 || '')}" placeholder="ex. France"></label>
+          <div class="span-2"><div class="row-gap" style="justify-content:space-between"><b class="small" id="mv-q"></b>
+            <span class="row-gap"><button type="button" class="link-btn small" data-all="1">Tout cocher</button><button type="button" class="link-btn small" data-all="0">Tout décocher</button></span></div>
+            <div class="mv-checks" id="mv-checks"></div></div>
+        </form>${countryDatalist()}
+        <p class="muted small">En validant, la Guest List est éditée en PDF avec tous les passagers à bord après ce mouvement, et gardée dans la Guest List du charter.</p>`,
+      footer: `<button class="btn btn-ghost" data-close>Annuler</button><button class="btn btn-ghost" data-ok="0">Enregistrer sans éditer</button><button class="btn btn-primary" data-ok="1">Valider et éditer la Guest List</button>` });
+    const f = $('#f-move', m);
+    const draw = () => {
+      const t = f.querySelector('input[name=type]:checked').value, date = f.date.value;
+      const aboard = new Set(aboardAt(c, date, cur?.d.id).map(x => x.d.id));
+      const cand = G.filter(x => t === 'disembark' ? aboard.has(x.d.id) : !aboard.has(x.d.id));
+      const sel = new Set(cur && cur.m.type === t ? cur.m.guests : (t === 'embark' && first ? cand.map(x => x.d.id) : []));
+      $('#mv-q', m).textContent = t === 'disembark' ? `Qui débarque ? (${cand.length} à bord le ${fdate(date)})` : `Qui embarque ? (${cand.length} pas encore à bord)`;
+      $('#mv-checks', m).innerHTML = cand.length ? cand.map(x => `<label class="check"><input type="checkbox" name="g" value="${x.d.id}" ${sel.has(x.d.id) ? 'checked' : ''}> <span><b>${esc(x.g.family || '')}</b> ${esc(x.g.given || '')}
+          <small class="muted">${esc(x.g.nationality || '')}${x.g.doc_no ? ' · ' + esc(x.g.doc_no) : ''}</small></span></label>`).join('')
+        : `<p class="muted small">${t === 'disembark' ? 'Personne à bord à cette date.' : 'Tous les passagers sont déjà à bord. Ajoutez d’abord les nouveaux passeports.'}</p>`;
     };
-  };
-  ACTIONS['guest-disembark'] = () => {
-    const c = charterById(CURRENT), V = voyageOf(c), d0 = clampDate(today(), c);
-    const m = openModal({ title: 'Disembark — passagers qui quittent le bord', wide: true,
-      body: `<form class="form-grid" id="f-dis">${stopFields({ date: d0, country: V.M.dis_country || V.M.emb_country }, c, 'de débarquement')}
-        <div class="span-2"><p class="small"><b>Qui débarque définitivement ?</b></p>
-        ${V.G.map(x => { const mv = guestMoves(c, x.g, V.M); return `<label class="check"><input type="checkbox" name="g" value="${x.d.id}"> <span><b>${esc(x.g.family || '')}</b> ${esc(x.g.given || '')}
-          <small class="muted">— à bord ${fdate(mv.emb.date).slice(0, 5)} → ${fdate(mv.dis.date).slice(0, 5)} ${esc(mv.dis.port || '')}</small></span></label>`; }).join('')}</div></form>${countryDatalist()}`,
-      footer: `<button class="btn btn-ghost" data-close>Annuler</button><button class="btn btn-primary" data-ok>Disembark</button>` });
-    $('[data-ok]', m).onclick = async ev => {
-      const f = $('#f-dis', m); if (!f.reportValidity()) return;
+    f.addEventListener('change', e => { if (e.target.name === 'type' || e.target.name === 'date') draw(); });
+    $$('[data-all]', m).forEach(x => x.addEventListener('click', () => $$('input[name=g]', m).forEach(i => { i.checked = x.dataset.all === '1'; })));
+    draw();
+    $$('[data-ok]', m).forEach(btn => btn.onclick = async ev => {
+      if (!f.reportValidity()) return;
       const ids = $$('input[name=g]:checked', f).map(i => i.value);
       if (!ids.length) { toast('Cochez au moins un passager', 'err'); return; }
       busy(ev.currentTarget, true);
+      const mv = { type: f.querySelector('input[name=type]:checked').value, date: f.date.value, port: f.port.value.trim(), country: f.country.value.trim(), guests: ids };
+      const label = `${mv.type === 'disembark' ? 'Disembark' : 'Embark'} ${fdate(mv.date)} ${mv.port}`;
       try {
-        for (const id of ids) { const x = V.G.find(y => y.d.id === id);
-          const g = { ...x.g, dis_date: f.date.value, dis_port: f.port.value.trim(), dis_country: f.country.value.trim() };
-          await api.update('charter_documents', id, { note: JSON.stringify(g) }); }
-        await reload(); closeModal(); route(); toast(`${ids.length} passager${ids.length > 1 ? 's' : ''} débarqué${ids.length > 1 ? 's' : ''}`);
+        let id = cur?.d.id;
+        if (cur) await api.update('charter_documents', id, { title: label, note: JSON.stringify(mv) });
+        else id = (await api.insert('charter_documents', { charter_id: c.id, folder: 'guest_moves', title: label, note: JSON.stringify(mv) })).id;
+        await reload();
+        if (ev.currentTarget.dataset.ok === '1') { closeModal(); await editMoveList(charterById(c.id), id, 'pdf'); }
+        else { closeModal(); route(); toast('Mouvement enregistré'); }
       } catch (e) { toast(errMsg(e), 'err'); busy(ev.currentTarget, false); }
-    };
+    });
   };
+  ACTIONS['move-del'] = async b => {
+    const d = (S.charter_documents || []).find(x => x.id === b.dataset.id); if (!d) return;
+    if (!(await confirmDialog(`Supprimer le mouvement « ${esc(d.title || '')} » ? Les Guest Lists déjà éditées restent dans la liste.`, 'Supprimer'))) return;
+    try { await api.remove('charter_documents', d.id); await reload(); route(); toast('Mouvement supprimé'); }
+    catch (e) { toast(errMsg(e), 'err'); }
+  };
+  ACTIONS['move-list'] = async b => { busy(b, true); try { await editMoveList(charterById(CURRENT), b.dataset.id, b.dataset.kind); } finally { busy(b, false); } };
+  // Guest List après un mouvement : tous les passagers à bord, départ du port du mouvement
+  async function editMoveList(c, moveId, kind) {
+    const H = boardHistory(c), st = H.steps.find(x => x.d.id === moveId); if (!st) return;
+    if (!st.aboard.length) { route(); toast('Plus personne à bord après ce débarquement : pas de Guest List à éditer', 'err'); return; }
+    const pt = { direction: 'departure', port: st.m.port, date: st.m.date, guests: st.aboard, move_id: moveId,
+      label: `Departure — ${fdate(st.m.date)} ${st.m.port || ''} (${st.aboard.length} pax)` };
+    let out;
+    try { out = kind === 'pdf' ? await fal6Pdf(c, pt) : (await loadScript(XLSX_JS), fal6Xlsx(c, pt)); }
+    catch (e) { toast(errMsg(e), 'err'); return; }
+    try { await archiveList(c, pt, out, kind === 'pdf' ? 'PDF' : 'Excel'); await reload(); route(); toast(`Guest List éditée : ${pt.guests.length} passager${pt.guests.length > 1 ? 's' : ''} à bord`); }
+    catch (e) { route(); toast(`Liste téléchargée mais non archivée : ${errMsg(e)}`, 'err'); }
+    saveBlob(out.blob, out.name);
+  }
 
   ACTIONS['guest-file'] = async b => {
     const d = (S.charter_documents || []).find(x => x.id === b.dataset.id); if (!d?.file_path) return;
@@ -2847,13 +2895,13 @@
   };
   ACTIONS['gl-del'] = async b => {
     const d = (S.charter_documents || []).find(x => x.id === b.dataset.id); if (!d) return;
-    if (!(await confirmDialog(`Supprimer la liste « ${esc(d.title || '')} » ?`, 'Supprimer'))) return;
-    try { await api.remove('charter_documents', d.id); if (d.file_path) await api.removeFile(d.file_path).catch(() => {}); await reload(); route(); toast('Liste supprimée'); }
+    if (!(await confirmDialog(`Supprimer la Guest List « ${esc(d.title || '')} » ?`, 'Supprimer'))) return;
+    try { await api.remove('charter_documents', d.id); if (d.file_path) await api.removeFile(d.file_path).catch(() => {}); await reload(); route(); toast('Guest List supprimée'); }
     catch (e) { toast(errMsg(e), 'err'); }
   };
   ACTIONS['guest-purge'] = async () => {
     const c = charterById(CURRENT); const withFile = guestsOf(c).filter(x => x.d.file_path);
-    if (!withFile.length || !(await confirmDialog(`Effacer définitivement les ${withFile.length} scan(s) de passeport de ce charter ? La liste des passagers est conservée.`, 'Effacer'))) return;
+    if (!withFile.length || !(await confirmDialog(`Effacer définitivement les ${withFile.length} scan(s) de passeport de ce charter ? Les fiches et les Guest Lists sont conservées.`, 'Effacer'))) return;
     try { for (const { d } of withFile) { await api.removeFile(d.file_path).catch(() => {}); await api.update('charter_documents', d.id, { file_path: null, file_name: null }); }
       await reload(); route(); toast('Scans effacés'); }
     catch (e) { toast(errMsg(e), 'err'); }
@@ -2862,8 +2910,8 @@
     const c = charterById(CURRENT), d = b.dataset.id ? (S.charter_documents || []).find(x => x.id === b.dataset.id) : null;
     guestModal(c, d);
   };
-  function guestModal(c, d, preset = {}) {
-    const g = { ...(d ? parseNote(d) : {}), ...preset }, M = guestMeta(c), mv = guestMoves(c, g, M);
+  function guestModal(c, d) {
+    const g = d ? parseNote(d) : {};
     const isImg = d?.file_name && /\.(jpe?g|png|webp|heic|gif)$/i.test(d.file_name);
     const opt = (v, cur, l = v) => `<option value="${esc(v)}" ${v === cur ? 'selected' : ''}>${esc(l)}</option>`;
     const m = openModal({ title: d ? 'Fiche passager' : 'Nouveau passager', wide: true,
@@ -2882,29 +2930,19 @@
           <label class="field"><span>14. Date d’expiration</span><input type="date" name="expiry" value="${esc(g.expiry || '')}"></label>
           <label class="field"><span>16. N° de visa <small>(si nécessaire)</small></span><input name="visa" value="${esc(g.visa || '')}"></label>
           <label class="check"><input type="checkbox" name="transit" ${g.transit ? 'checked' : ''}><span>18. Passager en transit</span></label>
-          <div class="field-sep span-2">Embarquement <small class="muted">(vide = début du charter : ${fdate(c.start_date)} ${esc(M.port_emb || '')})</small></div>
-          <label class="field"><span>Date</span><input type="date" name="emb_date" value="${esc(g.emb_date || '')}" min="${esc(c.start_date || '')}" max="${esc(c.end_date || '')}"></label>
-          <label class="field"><span>15. Port d’embarquement</span><input name="emb_port" value="${esc(g.emb_port || g.port_emb || '')}" placeholder="${esc(M.port_emb || '')}"></label>
-          <label class="field"><span>Pays</span><input name="emb_country" list="dl-countries" value="${esc(g.emb_country || '')}" placeholder="${esc(M.emb_country || '')}"></label>
-          <div class="field-sep span-2">Débarquement <small class="muted">(vide = fin du charter : ${fdate(c.end_date)} ${esc(M.port_dis || '')})</small></div>
-          <label class="field"><span>Date</span><input type="date" name="dis_date" value="${esc(g.dis_date || '')}" min="${esc(c.start_date || '')}" max="${esc(c.end_date || '')}"></label>
-          <label class="field"><span>17. Port de débarquement</span><input name="dis_port" value="${esc(g.dis_port || g.port_dis || '')}" placeholder="${esc(M.port_dis || '')}"></label>
-          <label class="field"><span>Pays</span><input name="dis_country" list="dl-countries" value="${esc(g.dis_country || '')}" placeholder="${esc(M.dis_country || '')}"></label>
           ${d ? '' : `<label class="field span-2"><span>Scan du passeport <small>(facultatif)</small></span><input type="file" name="file" accept="image/*,application/pdf,.heic"></label>`}
           <label class="check span-2"><input type="checkbox" name="checked" ${g.checked || !d ? 'checked' : ''}><span>J’ai vérifié ces informations avec le passeport</span></label>
-        </form>${countryDatalist()}`,
+        </form>${countryDatalist()}
+        <p class="muted small">L’embarquement et le débarquement se font avec les boutons Embark / Disembark.</p>`,
       footer: `<button class="btn btn-ghost" data-close>Annuler</button><button class="btn btn-primary" data-ok>Enregistrer</button>` });
     if (isImg) api.privateUrl(d.file_path).then(u => { const im = $('#guest-img', m); if (im) im.src = u; }).catch(() => { const w = $('.guest-scan', m); if (w) w.remove(); });
     $('[data-ok]', m).onclick = async ev => {
       const f = $('#f-guest', m); if (!f.reportValidity()) return; busy(ev.currentTarget, true);
       const fd = new FormData(f), file = fd.get('file');
       const v = k => String(fd.get(k) || '').trim();
-      const { port_emb, port_dis, ...rest } = g; // eslint-disable-line no-unused-vars
-      const ng = { ...rest, family: v('family').toUpperCase(), given: v('given'), nationality: v('nationality'), gender: v('gender'), dob: v('dob'),
+      const ng = { ...g, family: v('family').toUpperCase(), given: v('given'), nationality: v('nationality'), gender: v('gender'), dob: v('dob'),
         pob: v('pob'), doc_type: v('doc_type'), doc_no: v('doc_no').toUpperCase().replace(/\s+/g, ''), issuing: v('issuing'), expiry: v('expiry'),
-        visa: v('visa'), transit: !!fd.get('transit'), checked: !!fd.get('checked'), pob_auto: !!g.pob_auto && !fd.get('checked') && v('pob') === (g.pob || ''),
-        emb_date: v('emb_date'), emb_port: v('emb_port'), emb_country: v('emb_country'), dis_date: v('dis_date'), dis_port: v('dis_port'), dis_country: v('dis_country') };
-      if (ng.emb_date && ng.dis_date && ng.dis_date < ng.emb_date) { toast('Le débarquement doit être après l’embarquement', 'err'); busy(ev.currentTarget, false); return; }
+        visa: v('visa'), transit: !!fd.get('transit'), checked: !!fd.get('checked'), pob_auto: !!g.pob_auto && !fd.get('checked') && v('pob') === (g.pob || '') };
       if (!d) ng.order = Math.max(0, ...guestsOf(c).map(x => x.g.order ?? 0)) + 1;
       const row = { title: [ng.family, ng.given].filter(Boolean).join(' '), note: JSON.stringify(ng) };
       try {
@@ -2915,27 +2953,12 @@
     };
   }
 
-  // ---- Export : IMO FAL Form 6 (PDF A4 paysage, 12 passagers par page) et Excel, pour un départ ou une arrivée donnés
-  // Périodes du charter entre deux escales (embarquement / débarquement) : passagers à bord pendant chacune
-  function falSegments(c) {
-    const V = voyageOf(c), segs = [];
-    for (let i = 0; i < V.stops.length - 1; i++) {
-      const guests = V.onBoardAfter(i); if (!guests.length) continue;
-      const a = V.stops[i], b = V.stops[i + 1];
-      segs.push({ from: a, to: b, guests });
-    }
-    if (!segs.length) { const G = guestsOf(c), M = guestMeta(c);
-      if (G.length) segs.push({ from: { date: c.start_date, port: M.port_emb }, to: { date: c.end_date || c.start_date, port: M.port_dis }, guests: G }); }
-    return segs;
-  }
-  const segPoint = (sg, dir) => { const p = dir === 'arrival' ? sg.to : sg.from;
-    return { direction: dir, port: p.port, date: p.date, guests: sg.guests, period: `Du ${fdate(sg.from.date).slice(0, 5)} au ${fdate(sg.to.date).slice(0, 5)}`,
-      label: `${dir === 'arrival' ? 'Arrival' : 'Departure'} — ${fdate(p.date)} ${p.port || ''} (${sg.guests.length} pax)` }; };
+  // ---- Export : IMO FAL Form 6 (PDF A4 paysage, 12 passagers par page) et Excel
   function falRows(c, guests) {
-    const M = guestMeta(c);
-    return guests.map(({ g }) => { const mv = guestMoves(c, g, M);
+    const TL = guestTimeline(c), M = guestMeta(c);
+    return guests.map(({ d, g }) => { const t = TL(d.id);
       return [g.family || '', g.given || '', g.nationality || '', fdate(g.dob), g.pob || '', GENDERS[g.gender] || g.gender || '',
-        g.doc_type || '', g.doc_no || '', g.issuing || '', fdate(g.expiry), mv.emb.port || '', g.visa || '', mv.dis.port || '', g.transit ? 'Yes' : 'No']; });
+        g.doc_type || '', g.doc_no || '', g.issuing || '', fdate(g.expiry), t.emb?.port || M.port_emb || '', g.visa || '', t.dis?.port || M.port_dis || '', g.transit ? 'Yes' : 'No']; });
   }
   const FAL_HEAD = ['5. Family name', '6. Given names', '7. Nationality', '8. Date of birth', '9. Place of birth', '10. Gender', '11. Type of identity or travel document',
     '12. Serial number of identity or travel document', '13. Issuing State of identity or travel document', '14. Expiry date of identity or travel document',
@@ -2995,38 +3018,9 @@
   async function archiveList(c, pt, out, kind) {
     const up = await api.uploadPrivate(new File([out.blob], out.name, { type: out.blob.type }), `guest-lists/${c.id}`);
     await api.insert('charter_documents', { charter_id: c.id, folder: 'guest_lists', title: (pt.period ? pt.period + ' · ' : '') + pt.label.replace(/\s*\(\d+ pax\)$/, ''), ...up,
-      note: JSON.stringify({ direction: pt.direction, port: pt.port, date: pt.date, pax: pt.guests.length, kind, names: pt.guests.map(x => [x.g.family, x.g.given].filter(Boolean).join(' ')) }) });
+      note: JSON.stringify({ move_id: pt.move_id || null, direction: pt.direction, port: pt.port, date: pt.date, pax: pt.guests.length, kind, names: pt.guests.map(x => [x.g.family, x.g.given].filter(Boolean).join(' ')) }) });
   }
   // Choix du départ / de l'arrivée à éditer (direct s'il n'y en a qu'un)
-  function pickFalPoint(c, kind) {
-    const segs = falSegments(c);
-    if (!segs.length) return toast('Ajoutez d’abord des passagers', 'err');
-    const run = async (pt, btn) => {
-      busy(btn, true);
-      let out;
-      try { out = kind === 'pdf' ? await fal6Pdf(c, pt) : (await loadScript(XLSX_JS), fal6Xlsx(c, pt)); }
-      catch (e) { toast(errMsg(e), 'err'); busy(btn, false); return; }
-      closeModal();
-      try { await archiveList(c, pt, out, kind === 'pdf' ? 'PDF' : 'Excel'); await reload(); route(); toast('Liste enregistrée dans la Guest List'); }
-      catch (e) { toast(`Liste téléchargée mais non archivée : ${errMsg(e)}`, 'err'); }
-      saveBlob(out.blob, out.name);
-    };
-    const short = d => fdate(d).slice(0, 5);
-    const m = openModal({ title: `Passenger List (FAL 6) — ${kind === 'pdf' ? 'PDF' : 'Excel'}`,
-      body: `<div class="seg fal-dir" role="radiogroup" aria-label="Type de liste">
-          <label><input type="radio" name="fal-dir" value="departure" checked> <span>Departure (départ)</span></label>
-          <label><input type="radio" name="fal-dir" value="arrival"> <span>Arrival (arrivée)</span></label></div>
-        <p class="muted small">Choisissez la période : la liste contient les passagers à bord pendant ces dates.</p>
-        <div class="fal-points">${segs.map((sg, i) => `<button class="btn btn-ghost btn-block fal-seg" data-seg="${i}">
-          <b>Du ${short(sg.from.date)} au ${short(sg.to.date)}</b>
-          <span class="muted small">${esc(sg.from.port || '?')} → ${esc(sg.to.port || '?')} · ${sg.guests.length} pax</span></button>`).join('')}</div>` });
-    $$('[data-seg]', m).forEach(b => b.addEventListener('click', () => {
-      const dir = $('input[name=fal-dir]:checked', m).value;
-      run(segPoint(segs[+b.dataset.seg], dir), b);
-    }));
-  }
-  ACTIONS['fal6-pdf'] = () => pickFalPoint(charterById(CURRENT), 'pdf');
-  ACTIONS['fal6-xlsx'] = () => pickFalPoint(charterById(CURRENT), 'xlsx');
 
   // ---------------- VAT Exo FR : trajets hors des eaux territoriales françaises (critère des 70 %) ----------------
   function vatTrips(year) {

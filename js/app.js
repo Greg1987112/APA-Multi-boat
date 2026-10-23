@@ -356,8 +356,22 @@
       if (error) throw error;
       return { file_path: path, file_name: file.name };
     }
-    async removeFile(path) { if (path) await this.sb.storage.from('invoices').remove([path]); }
-    fileUrl(path) { return path ? this.sb.storage.from('invoices').getPublicUrl(path).data.publicUrl : null; }
+    async removeFile(path) { if (!path) return;
+      if (path.startsWith('priv:')) await this.sb.storage.from('private-docs').remove([path.slice(5)]);
+      else await this.sb.storage.from('invoices').remove([path]); }
+    fileUrl(path) { return path && !path.startsWith('priv:') ? this.sb.storage.from('invoices').getPublicUrl(path).data.publicUrl : null; }
+    // Stockage privé (passeports) : accès réservé au capitaine et à l'équipage, lien temporaire de 10 minutes
+    async uploadPrivate(file, prefix) {
+      const safe = file.name.normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/[^\w.\-]+/g, '_').slice(-80);
+      const path = `${this.boatId}/${prefix}/${uuid()}/${safe}`;
+      const { error } = await this.sb.storage.from('private-docs').upload(path, file, { contentType: file.type || undefined, upsert: false });
+      if (error) throw error;
+      return { file_path: 'priv:' + path, file_name: file.name };
+    }
+    async privateUrl(path) {
+      const { data, error } = await this.sb.storage.from('private-docs').createSignedUrl(String(path).replace(/^priv:/, ''), 600);
+      if (error) throw error; return data.signedUrl;
+    }
     async clientView(token) {
       const { data, error } = await this.sb.rpc('client_view', { p_token: token });
       if (error) throw error; return data;
@@ -486,7 +500,9 @@
       return { file_path: path, file_name: file.name };
     }
     async removeFile(path) { delete this.files[path]; }
-    fileUrl(path) { return path ? (this.files[path] || null) : null; }
+    fileUrl(path) { return path && !path.startsWith('priv:') ? (this.files[path] || null) : null; }
+    async uploadPrivate(file, prefix) { const r = await this.upload(file, prefix); this.files['priv:' + r.file_path] = this.files[r.file_path]; return { ...r, file_path: 'priv:' + r.file_path }; }
+    async privateUrl(path) { const u = this.files[path]; if (!u) throw new Error('Fichier disponible uniquement pendant la session démo'); return u; }
     async clientView(token) {
       const c = this.S.charters.find(x => x.client_token === token);
       if (!c) return null;
@@ -580,6 +596,7 @@
   const errMsg = e => {
     const m = (e && (e.message || e.error_description || e.details)) || String(e);
     if (/row-level security|permission denied|Non autorisé/i.test(m)) return 'Action non autorisée pour votre rôle sur ce bateau.';
+    if (/bucket not found|private-docs/i.test(m)) return `Base de données à mettre à jour : exécutez le fichier « maj-guest-list.sql » dans Supabase (SQL Editor). (${m})`;
     if (/boat_track/.test(m)) return `Base de données à mettre à jour : exécutez le fichier « maj-position.sql » dans Supabase (SQL Editor). (${m})`;
     const col = /(broker_fee_pct|auto_kind|auto_ref|'fee')/.exec(m);
     return col ? `Base de données à mettre à jour : exécutez le fichier « maj-frais.sql » dans Supabase (SQL Editor). (${m})` : m;
@@ -788,7 +805,7 @@
     short_name: 'Boat', legal_name: '', address: '', vat_number: '', registration: '', email: '', phone: '',
     iban: '', bic: '', bank: '', invoice_prefix: 'BOAT', vat_rate: 0,
     vat_mention: '', payment_terms: 'Montant prélevé sur l’APA (Advance Provisioning Allowance) du charter.', footer: '',
-    suppliers: [], mmsi: '',
+    suppliers: [], mmsi: '', imo: '', call_sign: '', flag_state: '',
   };
   let PROFILE = { ...PROFILE_DEFAULTS };
   const boatName = () => (PROFILE.short_name || 'Boat').trim();
@@ -1583,11 +1600,11 @@
   const ROLE_LABEL = { captain: 'Capitaine', crew: 'Équipage', viewer: 'Lecture seule' };
   const isCaptain = () => ROLE === 'captain', canEdit = () => ROLE === 'captain' || ROLE === 'crew';
   // Actions autorisées en lecture seule / réservées au capitaine (la base de données refuse de toute façon le reste)
-  const VIEW_OK = ['logout', 'print', 'xlsx', 'xlsx-charter', 'xlsx-fuel', 'zip', 'zip-charter', 'inv-register', 'plan-xlsx', 'demo-reset', 'share', 'boat-switch'];
-  const CAPTAIN_ONLY = ['close-charter', 'reopen', 'edit-charter', 'new-charter', 'send-report', 'notify-closed', 'inv-draft', 'inv-issue', 'master-sign', 'locked-edit', 'share-plan'];
+  const VIEW_OK = ['logout', 'print', 'xlsx', 'xlsx-charter', 'xlsx-fuel', 'zip', 'zip-charter', 'inv-register', 'plan-xlsx', 'demo-reset', 'share', 'boat-switch', 'fal6-pdf', 'fal6-xlsx', 'vat-xlsx'];
+  const CAPTAIN_ONLY = ['close-charter', 'reopen', 'edit-charter', 'new-charter', 'send-report', 'notify-closed', 'inv-draft', 'inv-issue', 'master-sign', 'locked-edit', 'share-plan', 'vat-add', 'vat-del', 'vat-proof-del', 'vat-zip'];
   function applyRoleStyle() {
     let el = document.getElementById('role-style'); if (!el) { el = document.createElement('style'); el.id = 'role-style'; document.head.appendChild(el); }
-    const hide = ROLE === 'viewer' ? `[data-act]:not(${VIEW_OK.map(a => `[data-act="${a}"]`).join(',')}), .file-btn, [data-doc-upload], #f-plan input, [data-share-itin], [data-live-always]`
+    const hide = ROLE === 'viewer' ? `[data-act]:not(${VIEW_OK.map(a => `[data-act="${a}"]`).join(',')}), .file-btn, [data-doc-upload], #f-plan input, #f-fal button, [data-share-itin], [data-live-always]`
       : ROLE === 'crew' ? CAPTAIN_ONLY.map(a => `[data-act="${a}"]`).join(',') + ', [data-share-itin], [data-live-always]' : '';
     el.textContent = hide ? `body.admin-app :is(${hide}) { display: none !important; }` : '';
     document.body.classList.add('admin-app'); document.body.dataset.role = ROLE;
@@ -1665,6 +1682,7 @@
         <nav class="nav">
           ${BOAT ? `<a href="#/charters" class="${active === 'charters' ? 'on' : ''}">Charters</a>
           <a href="#/fuel/voyages" class="${active === 'fuel' ? 'on' : ''}">Fuel booklet</a>
+          ${ROLE !== 'crew' ? `<a href="#/vat" class="${active === 'vat' ? 'on' : ''}">VAT Exo FR</a>` : ''}
           ${ROLE !== 'crew' ? `<a href="#/invoices" class="${active === 'invoices' ? 'on' : ''}">Factures</a>` : ''}
           ${isCaptain() ? `<a href="#/team" class="${active === 'team' ? 'on' : ''}">Équipage</a>
           <a href="#/settings" class="${active === 'settings' ? 'on' : ''}">Paramètres</a>` : ''}` : ''}
@@ -1733,6 +1751,7 @@
     if (parts[0] === 'settings' && !isCaptain()) { location.hash = '#/charters'; return; }
     if (parts[0] === 'charter' && parts[1]) return viewCharter(parts[1], parts[2]);
     if (parts[0] === 'fuel') return viewFuel(parts[1] || 'voyages');
+    if (parts[0] === 'vat') return viewVat(parts[1]);
     if (parts[0] === 'settings') return viewSettings();
     if (parts[0] === 'invoices') return viewInvoices(parts[1]);
     return viewCharters();
@@ -1815,6 +1834,9 @@
           <label class="field"><span>IBAN</span><input name="iban" value="${esc(P.iban)}"></label>
           <label class="field"><span>BIC</span><input name="bic" value="${esc(P.bic)}"></label>
           <label class="field"><span>MMSI du bateau <small>(9 chiffres — bouton « Voir sur MarineTraffic » pour le client)</small></span><input name="mmsi" inputmode="numeric" pattern="[0-9]{9}" value="${esc(P.mmsi || '')}" placeholder="ex. 319012345"></label>
+          <label class="field"><span>N° IMO <small>(Passenger List FAL 6)</small></span><input name="imo" value="${esc(P.imo || '')}" placeholder="ex. 1234567"></label>
+          <label class="field"><span>Indicatif d’appel (call sign)</span><input name="call_sign" value="${esc(P.call_sign || '')}" placeholder="ex. 2ABC3"></label>
+          <label class="field"><span>Pavillon</span><input name="flag_state" value="${esc(P.flag_state || '')}" placeholder="ex. Malta"></label>
         </div>
       </section>
       <section class="panel">
@@ -1982,8 +2004,9 @@
     const log = s => { const el = $('#imp-log', m); el.hidden = false; el.textContent += s + '\n'; el.scrollTop = el.scrollHeight; };
     $('[data-ok]', m).onclick = async ev => {
       const f = $('#f-imp', m); if (!f.reportValidity()) return;
-      if (S.charters.length && !(await new Promise(res => res(confirm('Ce bateau contient déjà des charters. Les données importées s’ajouteront (les doublons sont ignorés). Continuer ?'))))) return;
-      busy(ev.currentTarget, true);
+      const btn = ev.currentTarget;
+      if (S.charters.length && !confirm('Ce bateau contient déjà des charters. Les données importées s’ajouteront (les doublons sont ignorés). Continuer ?')) return;
+      busy(btn, true);
       try {
         const old = window.supabase.createClient(f.url.value.trim(), f.key.value.trim(), { auth: { persistSession: false, autoRefreshToken: false, storageKey: 'old-app-import' } });
         log('Connexion à l’ancienne app…');
@@ -2020,7 +2043,7 @@
         if (prof && (!PROFILE.legal_name && !PROFILE.address)) { await api.saveBoat({ profile: { ...PROFILE, ...prof } }); log('Fiche du bateau importée'); }
         await reload(); log('✓ Import terminé.'); toast('Import terminé');
       } catch (e) { log('✗ ' + errMsg(e)); toast(errMsg(e), 'err'); }
-      busy(ev.currentTarget, false);
+      busy(btn, false);
     };
   }
   // ---------------- Registre des factures émises par le bateau ----------------
@@ -2193,9 +2216,719 @@
       } catch (e) { toast(errMsg(e), 'err'); }
     };
   }
+  // ---------------- Guest List : passeports → liste des passagers (IMO FAL Form 6) ----------------
+  // Stocké dans charter_documents : une ligne par passager (folder 'guests', note = JSON, fichier = scan du passeport
+  // dans le stockage privé), et une ligne 'guests_meta' pour l'en-tête du formulaire. Jamais visible dans la vue client.
+  const COUNTRIES = {"ABW":"Aruba","AFG":"Afghanistan","AGO":"Angola","AIA":"Anguilla","ALA":"Åland Islands","ALB":"Albania","AND":"Andorra","ARE":"United Arab Emirates","ARG":"Argentina","ARM":"Armenia","ASM":"American Samoa","ATA":"Antarctica","ATF":"French Southern Territories","ATG":"Antigua and Barbuda","AUS":"Australia","AUT":"Austria","AZE":"Azerbaijan","BDI":"Burundi","BEL":"Belgium","BEN":"Benin","BES":"Caribbean Netherlands","BFA":"Burkina Faso","BGD":"Bangladesh","BGR":"Bulgaria","BHR":"Bahrain","BHS":"Bahamas","BIH":"Bosnia and Herzegovina","BLM":"Saint Barthélemy","BLR":"Belarus","BLZ":"Belize","BMU":"Bermuda","BOL":"Bolivia","BRA":"Brazil","BRB":"Barbados","BRN":"Brunei","BTN":"Bhutan","BVT":"Bouvet Island","BWA":"Botswana","CAF":"Central African Republic","CAN":"Canada","CCK":"Cocos (Keeling) Islands","CHE":"Switzerland","CHL":"Chile","CHN":"China","CIV":"Côte d'Ivoire","CMR":"Cameroon","COD":"DR Congo","COG":"Congo","COK":"Cook Islands","COL":"Colombia","COM":"Comoros","CPV":"Cabo Verde","CRI":"Costa Rica","CUB":"Cuba","CUW":"Curaçao","CXR":"Christmas Island","CYM":"Cayman Islands","CYP":"Cyprus","CZE":"Czechia","DEU":"Germany","DJI":"Djibouti","DMA":"Dominica","DNK":"Denmark","DOM":"Dominican Republic","DZA":"Algeria","ECU":"Ecuador","EGY":"Egypt","ERI":"Eritrea","ESH":"Western Sahara","ESP":"Spain","EST":"Estonia","ETH":"Ethiopia","FIN":"Finland","FJI":"Fiji","FLK":"Falkland Islands (Malvinas)","FRA":"France","FRO":"Faroe Islands","FSM":"Micronesia","GAB":"Gabon","GBR":"United Kingdom","GEO":"Georgia","GGY":"Guernsey","GHA":"Ghana","GIB":"Gibraltar","GIN":"Guinea","GLP":"Guadeloupe","GMB":"Gambia","GNB":"Guinea-Bissau","GNQ":"Equatorial Guinea","GRC":"Greece","GRD":"Grenada","GRL":"Greenland","GTM":"Guatemala","GUF":"French Guiana","GUM":"Guam","GUY":"Guyana","HKG":"Hong Kong","HMD":"Heard Island and McDonald Islands","HND":"Honduras","HRV":"Croatia","HTI":"Haiti","HUN":"Hungary","IDN":"Indonesia","IMN":"Isle of Man","IND":"India","IOT":"British Indian Ocean Territory","IRL":"Ireland","IRN":"Iran","IRQ":"Iraq","ISL":"Iceland","ISR":"Israel","ITA":"Italy","JAM":"Jamaica","JEY":"Jersey","JOR":"Jordan","JPN":"Japan","KAZ":"Kazakhstan","KEN":"Kenya","KGZ":"Kyrgyzstan","KHM":"Cambodia","KIR":"Kiribati","KNA":"Saint Kitts and Nevis","KOR":"South Korea","KWT":"Kuwait","LAO":"Laos","LBN":"Lebanon","LBR":"Liberia","LBY":"Libya","LCA":"Saint Lucia","LIE":"Liechtenstein","LKA":"Sri Lanka","LSO":"Lesotho","LTU":"Lithuania","LUX":"Luxembourg","LVA":"Latvia","MAC":"Macao","MAF":"Saint Martin (French part)","MAR":"Morocco","MCO":"Monaco","MDA":"Moldova","MDG":"Madagascar","MDV":"Maldives","MEX":"Mexico","MHL":"Marshall Islands","MKD":"North Macedonia","MLI":"Mali","MLT":"Malta","MMR":"Myanmar","MNE":"Montenegro","MNG":"Mongolia","MNP":"Northern Mariana Islands","MOZ":"Mozambique","MRT":"Mauritania","MSR":"Montserrat","MTQ":"Martinique","MUS":"Mauritius","MWI":"Malawi","MYS":"Malaysia","MYT":"Mayotte","NAM":"Namibia","NCL":"New Caledonia","NER":"Niger","NFK":"Norfolk Island","NGA":"Nigeria","NIC":"Nicaragua","NIU":"Niue","NLD":"Netherlands","NOR":"Norway","NPL":"Nepal","NRU":"Nauru","NZL":"New Zealand","OMN":"Oman","PAK":"Pakistan","PAN":"Panama","PCN":"Pitcairn","PER":"Peru","PHL":"Philippines","PLW":"Palau","PNG":"Papua New Guinea","POL":"Poland","PRI":"Puerto Rico","PRK":"North Korea","PRT":"Portugal","PRY":"Paraguay","PSE":"Palestine","PYF":"French Polynesia","QAT":"Qatar","REU":"Réunion","ROU":"Romania","RUS":"Russia","RWA":"Rwanda","SAU":"Saudi Arabia","SDN":"Sudan","SEN":"Senegal","SGP":"Singapore","SGS":"South Georgia and the South Sandwich Islands","SHN":"Saint Helena","SJM":"Svalbard and Jan Mayen","SLB":"Solomon Islands","SLE":"Sierra Leone","SLV":"El Salvador","SMR":"San Marino","SOM":"Somalia","SPM":"Saint Pierre and Miquelon","SRB":"Serbia","SSD":"South Sudan","STP":"Sao Tome and Principe","SUR":"Suriname","SVK":"Slovakia","SVN":"Slovenia","SWE":"Sweden","SWZ":"Eswatini","SXM":"Sint Maarten (Dutch part)","SYC":"Seychelles","SYR":"Syria","TCA":"Turks and Caicos Islands","TCD":"Chad","TGO":"Togo","THA":"Thailand","TJK":"Tajikistan","TKL":"Tokelau","TKM":"Turkmenistan","TLS":"Timor-Leste","TON":"Tonga","TTO":"Trinidad and Tobago","TUN":"Tunisia","TUR":"Türkiye","TUV":"Tuvalu","TWN":"Taiwan","TZA":"Tanzania","UGA":"Uganda","UKR":"Ukraine","UMI":"United States Minor Outlying Islands","URY":"Uruguay","USA":"United States","UZB":"Uzbekistan","VAT":"Holy See","VCT":"Saint Vincent and the Grenadines","VEN":"Venezuela","VGB":"British Virgin Islands","VIR":"US Virgin Islands","VNM":"Vietnam","VUT":"Vanuatu","WLF":"Wallis and Futuna","WSM":"Samoa","YEM":"Yemen","ZAF":"South Africa","ZMB":"Zambia","ZWE":"Zimbabwe","D":"Germany","GBD":"United Kingdom (BOTC)","GBN":"United Kingdom (BN(O))","GBO":"United Kingdom (BOC)","GBS":"United Kingdom (BS)","GBP":"United Kingdom (BPP)","RKS":"Kosovo","UNO":"United Nations","UNA":"United Nations agency","XXA":"Stateless","XXB":"Refugee","XXC":"Refugee","XXX":"Unspecified","EUE":"European Union"};
+  const COUNTRY_NAMES = [...new Set(Object.values(COUNTRIES))].sort();
+  const countryName = code => COUNTRIES[String(code || '').replace(/</g, '')] || String(code || '').replace(/</g, '');
+  const parseNote = d => { try { return JSON.parse(d.note || '{}') || {}; } catch { return {}; } };
+  const guestsOf = c => (S.charter_documents || []).filter(d => d.charter_id === c.id && d.folder === 'guests')
+    .map(d => ({ d, g: parseNote(d) }))
+    .sort((a, b) => (a.g.order ?? 0) - (b.g.order ?? 0) || String(a.d.created_at || '').localeCompare(String(b.d.created_at || '')));
+  const guestMetaRow = c => (S.charter_documents || []).find(d => d.charter_id === c.id && d.folder === 'guests_meta');
+  function tripPorts(c) {
+    const legs = (getPlan(c).legs || []).filter(l => l.trip);
+    const split = s => String(s || '').split(/\s*(?:→|->|>|–|—| - |\/)\s*/).map(x => x.trim()).filter(Boolean);
+    const first = legs.length ? split(legs[0].trip)[0] : '', lastL = legs.length ? split(legs[legs.length - 1].trip) : [];
+    return { emb: first || '', dis: lastL[lastL.length - 1] || '' };
+  }
+  function guestMeta(c) {
+    const p = guestMetaRow(c) ? parseNote(guestMetaRow(c)) : {};
+    const tp = tripPorts(c);
+    const d = { voyage: '', port_emb: tp.emb, emb_country: c.vat_country || '', port_dis: tp.dis, dis_country: c.vat_country || '', master: '' };
+    Object.keys(d).forEach(k => { if (p[k]) d[k] = p[k]; });
+    return d;
+  }
+  const GENDERS = { M: 'Male', F: 'Female', X: 'Other' };
+  const DOC_TYPES = ['Passport', 'Identity card', 'Other'];
+  const GUEST_REQUIRED = [['family', 'nom'], ['given', 'prénoms'], ['nationality', 'nationalité'], ['dob', 'date de naissance'],
+    ['pob', 'lieu de naissance'], ['gender', 'sexe'], ['doc_no', 'n° du document'], ['issuing', 'pays émetteur'], ['expiry', 'date d’expiration']];
+  const guestMissing = g => GUEST_REQUIRED.filter(([k]) => !g[k]).map(([, l]) => l);
+  const plusMonths = (d, n) => { const x = new Date(d + 'T12:00:00Z'); x.setUTCMonth(x.getUTCMonth() + n); return x.toISOString().slice(0, 10); };
+  function expiryState(g, c) {
+    if (!g.expiry) return '';
+    const end = c.end_date || c.start_date || today();
+    if (g.expiry < end) return 'bad';
+    if (g.expiry < plusMonths(end, 6)) return 'warn';
+    return '';
+  }
+
+  // ---- Lecture de la bande MRZ (2 lignes de 44 car. pour un passeport, 3 de 30 pour une carte d'identité)
+  const MRZ_W = [7, 3, 1];
+  const mrzVal = ch => ch === '<' ? 0 : /\d/.test(ch) ? +ch : /[A-Z]/.test(ch) ? ch.charCodeAt(0) - 55 : 0;
+  const mrzCheck = s => String([...s].reduce((t, ch, i) => t + mrzVal(ch) * MRZ_W[i % 3], 0) % 10);
+  const TO_DIGIT = { O: '0', Q: '0', D: '0', U: '0', C: '0', I: '1', L: '1', T: '1', J: '1', Z: '2', S: '5', G: '6', B: '8', A: '4', E: '3' };
+  const TO_ALPHA = { 0: 'O', 1: 'I', 2: 'Z', 4: 'A', 5: 'S', 6: 'G', 8: 'B', 3: 'E', 7: 'T' };
+  const asDigits = s => s.replace(/[A-Z]/g, ch => TO_DIGIT[ch] || ch);
+  const asAlpha = s => s.replace(/\d/g, d => TO_ALPHA[d] || d);
+  const AMBIG = { O: '0', 0: 'O', I: '1', 1: 'I', S: '5', 5: 'S', B: '8', 8: 'B', Z: '2', 2: 'Z', G: '6', 6: 'G', D: '0', Q: '0' };
+  function fixWithCheck(field, check) {
+    if (!/\d/.test(check)) return { v: field, ok: false };
+    if (mrzCheck(field) === check) return { v: field, ok: true };
+    const idx = [...field].map((ch, i) => AMBIG[ch] ? i : -1).filter(i => i >= 0).slice(0, 9);
+    for (let mask = 1; mask < (1 << idx.length); mask++) {
+      const a = [...field]; idx.forEach((i, k) => { if (mask & (1 << k)) a[i] = AMBIG[a[i]]; });
+      const v = a.join(''); if (mrzCheck(v) === check) return { v, ok: true };
+    }
+    return { v: field, ok: false };
+  }
+  function mrzDate(s, kind) {
+    if (!/^\d{6}$/.test(s)) return '';
+    const yy = +s.slice(0, 2), mm = +s.slice(2, 4), dd = +s.slice(4, 6);
+    if (mm < 1 || mm > 12 || dd < 1 || dd > 31) return '';
+    const cy = new Date().getFullYear() % 100;
+    const y = kind === 'dob' ? (yy > cy ? 1900 + yy : 2000 + yy) : 2000 + yy;
+    return `${y}-${String(mm).padStart(2, '0')}-${String(dd).padStart(2, '0')}`;
+  }
+  // Les caractères de remplissage « < » sont souvent lus K, L, S, C… : on coupe la fin faite uniquement de ces caractères
+  function cutFiller(x) {
+    for (let i = 0; i < x.length; i++) if (x[i] === '<' && /^[<KLSCZRXT1]*$/.test(x.slice(i)) && (x.slice(i).length >= 3 || /^<+$/.test(x.slice(i)))) return x.slice(0, i);
+    return x;
+  }
+  function mrzNames(s) {
+    s = asAlpha(String(s || ''));
+    const i = s.indexOf('<<');
+    const clean = x => x.replace(/</g, ' ').replace(/\s+/g, ' ').trim();
+    return i < 0 ? { family: clean(cutFiller(s)), given: '' } : { family: clean(s.slice(0, i)), given: clean(cutFiller(s.slice(i + 2))) };
+  }
+  function parseMRZ(text) {
+    const lines = String(text || '').split(/\n/).map(l => l.toUpperCase().replace(/[«‹(\[{]/g, '<').replace(/\s+/g, '').replace(/[^A-Z0-9<]/g, ''))
+      .filter(l => l.length >= 24);
+    const D = '[0-9OQDUCILTJZSGBAE]';
+    const core = new RegExp(`(${D}{6})(${D})([MFX<])(${D}{6})(${D})`, 'g');
+    let best = null;
+    lines.forEach((L, i) => {
+      for (const m of L.matchAll(core)) {
+        const idx = m.index;
+        const dobRaw = asDigits(m[1]), dobChk = asDigits(m[2]), expRaw = asDigits(m[4]), expChk = asDigits(m[5]);
+        const dobOk = mrzCheck(dobRaw) === dobChk, expOk = mrzCheck(expRaw) === expChk;
+        let doc, docChk, nat, l1, names, type, issuing;
+        if (idx >= 13) {           // passeport (TD3) ou ancien format 2 lignes (TD2)
+          doc = L.slice(idx - 13, idx - 4); docChk = asDigits(L[idx - 4] || ''); nat = L.slice(idx - 3, idx);
+          l1 = lines[i - 1] || ''; names = mrzNames(l1.slice(5)); type = l1[0]; issuing = l1.slice(2, 5);
+        } else if (idx <= 1) {     // carte d'identité (TD1, 3 lignes)
+          l1 = lines[i - 1] || ''; nat = L.slice(idx + 15, idx + 18);
+          doc = l1.slice(5, 14); docChk = asDigits(l1[14] || ''); type = l1[0]; issuing = l1.slice(2, 5);
+          names = mrzNames(lines[i + 1] || '');
+        } else continue;
+        const docFix = fixWithCheck(doc, docChk);
+        const score = (dobOk ? 1 : 0) + (expOk ? 1 : 0) + (docFix.ok ? 1 : 0) + (names.family ? 0.5 : 0);
+        if (best && best.score >= score) continue;
+        const dt = type === 'P' ? 'Passport' : /[IAC]/.test(type || '') ? 'Identity card' : (idx >= 13 ? 'Passport' : 'Identity card');
+        best = { score, ok: dobOk && expOk && docFix.ok,
+          fields: { family: names.family, given: names.given, nationality: countryName(asAlpha(nat)), dob: mrzDate(dobRaw, 'dob'),
+            gender: m[3] === '<' ? '' : m[3], doc_type: dt, doc_no: docFix.v.replace(/</g, ''), issuing: countryName(asAlpha(issuing || '')),
+            expiry: mrzDate(expRaw, 'exp') } };
+      }
+    });
+    return best;
+  }
+  // Prépare l'image : rotation, recadrage (bas de page = bande MRZ), niveaux de gris contrastés, ~1800 px de large
+  function mrzCanvas(src, rot, fromTop) {
+    const sw = src.width, sh = src.height, r = rot % 180 !== 0;
+    const R = document.createElement('canvas'); R.width = r ? sh : sw; R.height = r ? sw : sh;
+    const rc = R.getContext('2d'); rc.translate(R.width / 2, R.height / 2); rc.rotate(rot * Math.PI / 180); rc.drawImage(src, -sw / 2, -sh / 2);
+    const y0 = Math.round(R.height * fromTop), h0 = R.height - y0, k = Math.min(3, 1800 / R.width);
+    const cv = document.createElement('canvas'); cv.width = Math.round(R.width * k); cv.height = Math.round(h0 * k);
+    const cx = cv.getContext('2d'); cx.imageSmoothingQuality = 'high'; cx.drawImage(R, 0, y0, R.width, h0, 0, 0, cv.width, cv.height);
+    const im = cx.getImageData(0, 0, cv.width, cv.height), p = im.data, hist = new Uint32Array(256);
+    for (let j = 0; j < p.length; j += 4) { const g = (p[j] * 0.3 + p[j + 1] * 0.59 + p[j + 2] * 0.11) | 0; p[j] = g; hist[g]++; }
+    const n = p.length / 4; let lo = 0, hi = 255, acc = 0;
+    for (let v = 0; v < 256; v++) { acc += hist[v]; if (acc > n * 0.02) { lo = v; break; } }
+    acc = 0; for (let v = 255; v >= 0; v--) { acc += hist[v]; if (acc > n * 0.02) { hi = v; break; } }
+    const span = Math.max(1, hi - lo);
+    for (let j = 0; j < p.length; j += 4) { const g = Math.max(0, Math.min(255, ((p[j] - lo) * 255 / span) | 0)); p[j] = p[j + 1] = p[j + 2] = g; }
+    cx.putImageData(im, 0, 0); return cv;
+  }
+  async function readPassport(file, onStep) {
+    const name = file.name.toLowerCase();
+    let sources;
+    if (file.type === 'application/pdf' || name.endsWith('.pdf')) sources = await pdfPagesAsCanvas(file, 2);
+    else { const bmp = await createImageBitmap(file); sources = [bmp]; }
+    await loadScript(TESS_JS);
+    const worker = await window.Tesseract.createWorker('eng', 1, { ...TESS_OPTS });
+    await worker.setParameters({ tessedit_char_whitelist: 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789<', tessedit_pageseg_mode: '6' });
+    let best = null, step = 0;
+    try {
+      for (const src of sources) {
+        const passes = [[0, 0.55], [0, 0], [180, 0.55], [90, 0.55], [270, 0.55]];
+        for (const [rot, top] of passes) {
+          onStep && onStep(++step);
+          const r = parseMRZ((await worker.recognize(mrzCanvas(src, rot, top))).data.text);
+          if (r && (!best || r.score > best.score)) best = r;
+          if (best && best.ok) return best;
+        }
+      }
+    } finally { await worker.terminate(); }
+    return best && best.score >= 1 ? best : null;
+  }
+
+  // ---- Mouvements de passagers (embarquements / débarquements) et trajets
+  const isFR = s => /^\s*(fr|fra|france)\b/i.test(String(s || ''));
+  const portKey = p => `${p.date || ''}|${String(p.port || '').trim().toLowerCase()}`;
+  function guestMoves(c, g, M = guestMeta(c)) {
+    return {
+      emb: { date: g.emb_date || c.start_date || '', port: g.emb_port || g.port_emb || M.port_emb || '', country: g.emb_country || M.emb_country || '' },
+      dis: { date: g.dis_date || c.end_date || c.start_date || '', port: g.dis_port || g.port_dis || M.port_dis || '', country: g.dis_country || M.dis_country || '' },
+    };
+  }
+  // Liste ordonnée des escales où des passagers montent ou descendent, et passagers à bord après chacune
+  function voyageOf(c) {
+    const M = guestMeta(c), G = guestsOf(c), map = new Map();
+    const add = (pt, kind, x) => { const k = portKey(pt); let m = map.get(k); if (!m) map.set(k, m = { ...pt, key: k, emb: [], dis: [] }); if (x) m[kind].push(x); return k; };
+    add({ date: c.start_date || '', port: M.port_emb, country: M.emb_country }, 'emb');
+    G.forEach(x => { const mv = guestMoves(c, x.g, M); x.embKey = add(mv.emb, 'emb', x); x.disKey = add(mv.dis, 'dis', x); });
+    add({ date: c.end_date || c.start_date || '', port: M.port_dis, country: M.dis_country }, 'dis');
+    const stops = [...map.values()].sort((a, b) => String(a.date).localeCompare(String(b.date)));
+    const idx = new Map(stops.map((s, i) => [s.key, i]));
+    G.forEach(x => { x.ei = idx.get(x.embKey); x.di = idx.get(x.disKey); });
+    const onBoardAfter = i => G.filter(x => x.ei <= i && x.di > i);
+    return { M, G, stops, onBoardAfter };
+  }
+  // Trajets au sens des douanes : un contrat = un trajet, sauf si des passagers montent ou descendent définitivement en escale
+  function trajetsOf(c) {
+    const V = voyageOf(c), out = [];
+    if (!V.G.length) {
+      const a = V.stops[0], b = V.stops[V.stops.length - 1];
+      return [{ c, from: a, to: b, pax: null, key: `${c.id}|${a.key}|${b.key}` }];
+    }
+    for (let i = 0; i < V.stops.length - 1; i++) {
+      const pax = V.onBoardAfter(i).length; if (!pax) continue;
+      const from = V.stops[i], to = V.stops[i + 1];
+      out.push({ c, from, to, pax, key: `${c.id}|${from.key}|${to.key}` });
+    }
+    return out;
+  }
+  const trajetAuto = t => !!(t.from.country && !isFR(t.from.country)) || !!(t.to.country && !isFR(t.to.country));
+  const trajetOut = t => { const f = (PROFILE.vat_flags || {})[t.key]; return f === true || f === false ? f : trajetAuto(t); };
+  const stopLabel = p => `${esc(p.port || '—')}${p.country ? ` <small class="muted">(${esc(p.country)})</small>` : ''}`;
+
+  // ---- Page « Guest List »
+  function viewGuestList(c) {
+    const V = voyageOf(c), M = V.M, list = V.G, P = PROFILE;
+    const missingTable = (S._missing || []).includes('charter_documents');
+    const toCheck = list.filter(({ g }) => !g.checked && !g.mrz_ok).length;
+    const incomplete = list.filter(({ g }) => guestMissing(g).length).length;
+    const shipInfo = [['Nom', BOAT?.name || YACHT], ['IMO', P.imo], ['Call sign', P.call_sign], ['Pavillon', P.flag_state]];
+    const shipMissing = shipInfo.filter(([, v]) => !v).map(([l]) => l);
+    const row = (x, i) => {
+      const { d, g } = x, miss = guestMissing(g), ex = expiryState(g, c), mv = guestMoves(c, g, M);
+      const state = (g.checked ? '<span class="badge badge-ok">Vérifié</span>'
+        : g.mrz_ok ? '<span class="badge badge-ok">Lu ✓</span>'
+        : '<span class="chip chip-warn" title="Lecture incertaine : comparez avec le passeport">À vérifier</span>')
+        + (miss.length ? `<br><small class="muted">à compléter : ${esc(miss.join(', '))}</small>` : '');
+      return `<tr>
+        <td data-label="N°"><div>${i + 1}</div></td>
+        <td data-label="Nom"><div><b>${esc(g.family || '—')}</b> ${esc(g.given || '')}</div></td>
+        <td data-label="Nationalité"><div>${esc(g.nationality || '')}</div></td>
+        <td data-label="Naissance"><div>${fdate(g.dob)}${g.pob ? `<br><small class="muted">${esc(g.pob)}</small>` : ''}</div></td>
+        <td data-label="Document"><div>${esc(g.doc_no || '')}<br><small class="muted">${esc(g.doc_type || '')}${g.issuing ? ' · ' + esc(g.issuing) : ''}</small></div></td>
+        <td data-label="Expiration" class="${ex === 'bad' ? 'neg' : ex === 'warn' ? 'warn' : ''}"><div>${fdate(g.expiry)}${ex === 'bad' ? '<br><small>expiré pendant le charter</small>' : ex === 'warn' ? '<br><small>moins de 6 mois</small>' : ''}</div></td>
+        <td data-label="À bord"><div>${fdate(mv.emb.date).slice(0, 5)} ${esc(mv.emb.port || '')}<br><small class="muted">→ ${fdate(mv.dis.date).slice(0, 5)} ${esc(mv.dis.port || '')}</small></div></td>
+        <td data-label="État"><div>${state}</div></td>
+        <td class="actions"><div class="row-gap" style="justify-content:flex-end">
+          ${d.file_path ? `<button class="icon-btn" data-act="guest-file" data-id="${d.id}" title="Voir le passeport">${ICON.eye}</button>` : ''}
+          <button class="icon-btn" data-act="guest-edit" data-id="${d.id}" title="Modifier">${ICON.edit}</button>
+          <button class="icon-btn danger" data-act="guest-del" data-id="${d.id}" title="Supprimer">${ICON.trash}</button></div></td></tr>`;
+    };
+    const trajets = trajetsOf(c);
+    const stopRow = (s, i) => {
+      const after = V.onBoardAfter(i).length;
+      const names = arr => arr.map(x => esc([x.g.family, x.g.given].filter(Boolean).join(' '))).join(', ');
+      return `<div class="mv-stop"><div class="mv-dot ${s.emb.length ? 'in' : ''}${s.dis.length ? ' out' : ''}"></div><div>
+        <b>${fdate(s.date)} · ${stopLabel(s)}</b>
+        ${s.emb.length ? `<div class="small"><span class="badge badge-ok">Embark ${s.emb.length}</span> ${names(s.emb)}</div>` : ''}
+        ${s.dis.length ? `<div class="small"><span class="badge badge-open">Disembark ${s.dis.length}</span> ${names(s.dis)}</div>` : ''}
+        ${list.length && i < V.stops.length - 1 ? `<div class="muted small">${after} passager${after > 1 ? 's' : ''} à bord ensuite</div>` : ''}</div></div>`;
+    };
+    $('#app').innerHTML = shell('charters', `
+      <a class="back" href="#/charters">${ICON.back}Charters</a>
+      <div class="page-head">
+        <div><div class="eyebrow">${esc(c.yacht || YACHT)}</div><h1>${esc(c.title)}</h1>
+          <p class="muted">${esc(c.client_name || '')}${c.client_name ? ' · ' : ''}${fdate(c.start_date)} → ${fdate(c.end_date)} · ${statusBadge(c)}</p></div>
+        <div class="head-actions">
+          <button class="btn btn-ghost" data-act="fal6-xlsx" ${list.length ? '' : 'disabled'}>${ICON.sheet}Excel</button>
+          <button class="btn btn-gold" data-act="fal6-pdf" ${list.length ? '' : 'disabled'}>${ICON.file}FAL 6 (PDF)</button></div>
+      </div>
+      ${folderTabs(c, 'guests')}
+      ${missingTable ? `<div class="banner banner-gold">${ICON.lock}<div>Pour utiliser ce dossier, exécutez une fois le fichier <b>maj-dossiers.sql</b> dans Supabase (SQL Editor), puis rechargez la page.</div></div>` : ''}
+      <section class="panel">
+        <div class="panel-head"><h2>Passagers${list.length ? ` (${list.length})` : ''}</h2>
+          <div class="row-gap wrap">
+            <button class="btn btn-ghost btn-sm" data-act="guest-edit">${ICON.plus}Ajouter à la main</button>
+            <label class="btn btn-primary btn-sm file-btn">${ICON.plus}Ajouter des passeports<input type="file" multiple class="sr-file" id="guest-upload" accept="image/*,application/pdf,.heic"></label></div></div>
+        <p class="muted small">Photo ou PDF de la page d’identité, un fichier par passager. La bande du bas (MRZ) est lue automatiquement dans le téléphone : nom, nationalité, date de naissance, sexe, n° et expiration. Le <b>lieu de naissance</b> n’y figure pas : complétez-le. Les scans sont rangés dans un espace privé (capitaine et équipage) et n’apparaissent jamais dans la vue client.</p>
+        <div id="guest-progress" class="banner banner-info" hidden></div>
+        ${toCheck || incomplete ? `<div class="banner banner-gold">${ICON.eye}<div>${toCheck ? `<b>${toCheck} passager${toCheck > 1 ? 's' : ''} à vérifier</b> : lecture incertaine, comparez la fiche avec le passeport. ` : ''}${incomplete ? `<b>${incomplete} fiche${incomplete > 1 ? 's' : ''} à compléter</b> (le lieu de naissance n’est pas dans la bande MRZ).` : ''}</div></div>` : ''}
+        ${list.length ? `<div class="table-wrap"><table class="table table-cards table-compact"><thead><tr><th>N°</th><th>Nom</th><th>Nationalité</th><th>Naissance</th><th>Document</th><th>Expiration</th><th>À bord</th><th>État</th><th></th></tr></thead>
+          <tbody>${list.map(row).join('')}</tbody></table></div>`
+          : `<div class="empty-state"><p class="muted">Aucun passager. Ajoutez les photos des passeports : la liste se remplit toute seule.</p></div>`}
+      </section>
+      <section class="panel">
+        <div class="panel-head"><h2>Embarquements & débarquements</h2>
+          <div class="row-gap wrap">
+            <button class="btn btn-ghost btn-sm" data-act="guest-disembark" ${list.length ? '' : 'disabled'}>Disembark</button>
+            <button class="btn btn-primary btn-sm" data-act="guest-embark">Embark</button></div></div>
+        <p class="muted small">Un passager qui monte ou descend définitivement pendant le charter crée une nouvelle escale : la Guest List (FAL 6) peut alors être éditée pour chaque départ et chaque arrivée, et le charter compte plusieurs trajets dans l’onglet <a href="#/vat">VAT Exo FR</a>.</p>
+        <div class="mv-list">${V.stops.map(stopRow).join('')}</div>
+        <p class="small"><span class="muted">Trajets douane pour ce charter :</span> <b>${trajets.length}</b>${trajets.length ? ' — ' + trajets.map(t => `${esc(t.from.port || '?')} → ${esc(t.to.port || '?')} ${trajetOut(t) ? '<span class="badge badge-ok">hors eaux FR</span>' : '<span class="badge badge-open">eaux FR</span>'}`).join(' · ') : ''}</p>
+      </section>
+      <section class="panel">
+        <div class="panel-head"><h2>Formulaire FAL 6</h2></div>
+        <p class="muted small">Embarquement et débarquement prévus pour tous les passagers (aux dates du charter), sauf ceux que vous faites monter ou descendre en cours de route.</p>
+        ${shipMissing.length ? `<div class="banner banner-gold">${ICON.anchor}<div>À compléter dans <a href="#/settings">Paramètres</a> : ${shipMissing.join(', ')} du bateau.</div></div>` : ''}
+        <p class="small">${shipInfo.map(([l, v]) => `<span class="muted">${l} :</span> <b>${esc(v || '—')}</b>`).join(' &nbsp;·&nbsp; ')}</p>
+        <form id="f-fal" class="form-grid">
+          <label class="field"><span>15. Port d’embarquement · ${fdate(c.start_date)}</span><input name="port_emb" value="${esc(M.port_emb)}" placeholder="ex. Cannes"></label>
+          <label class="field"><span>Pays</span><input name="emb_country" list="dl-countries" value="${esc(M.emb_country)}"></label>
+          <label class="field"><span>17. Port de débarquement · ${fdate(c.end_date)}</span><input name="port_dis" value="${esc(M.port_dis)}" placeholder="ex. Monaco"></label>
+          <label class="field"><span>Pays</span><input name="dis_country" list="dl-countries" value="${esc(M.dis_country)}"></label>
+          <label class="field"><span>1.4 N° de voyage</span><input name="voyage" value="${esc(M.voyage)}" placeholder="facultatif"></label>
+          <label class="field"><span>19. Signataire (capitaine, agent ou officier)</span><input name="master" value="${esc(M.master)}" placeholder="ex. Capt. Grégoire Duflos"></label>
+          <div class="span-2"><button class="btn btn-primary btn-sm" type="submit">Enregistrer</button></div>
+        </form>
+        ${countryDatalist()}
+      </section>
+      ${list.some(({ d }) => d.file_path) ? `<section class="panel">
+        <div class="panel-head"><h2>Données personnelles</h2><button class="btn btn-ghost btn-sm" data-act="guest-purge">${ICON.trash}Effacer les scans</button></div>
+        <p class="muted small">Après le charter, effacez les scans des passeports : la liste des passagers et le formulaire FAL 6 restent disponibles.</p></section>` : ''}`);
+
+    const f = $('#f-fal');
+    f.addEventListener('submit', async e => {
+      e.preventDefault(); const btn = $('button[type=submit]', f); busy(btn, true);
+      const note = JSON.stringify({ ...(guestMetaRow(c) ? parseNote(guestMetaRow(c)) : {}), ...Object.fromEntries(new FormData(f)) });
+      try { const r = guestMetaRow(c);
+        r ? await api.update('charter_documents', r.id, { note }) : await api.insert('charter_documents', { charter_id: c.id, folder: 'guests_meta', title: 'FAL 6', note });
+        await reload(); route(); toast('Enregistré'); }
+      catch (err) { toast(errMsg(err), 'err'); busy(btn, false); }
+    });
+    const inp = $('#guest-upload');
+    inp.addEventListener('change', () => addPassports(c, [...inp.files], null, $('#guest-progress')));
+  }
+  const countryDatalist = () => $('#dl-countries') ? '' : `<datalist id="dl-countries">${COUNTRY_NAMES.map(n => `<option value="${esc(n)}">`).join('')}</datalist>`;
+
+  // Lit et enregistre une série de passeports (emb = embarquement en cours de charter, sinon embarquement initial)
+  async function addPassports(c, files, emb, box) {
+    if (!files.length) return;
+    if (box) box.hidden = false;
+    let order = Math.max(0, ...guestsOf(c).map(x => x.g.order ?? 0)) + 1, ok = 0, unsure = 0, dup = 0;
+    const known = new Set(guestsOf(c).map(x => x.g.doc_no).filter(Boolean));
+    for (let k = 0; k < files.length; k++) {
+      const file = files[k];
+      const say = s => { if (box) box.innerHTML = `<span class="spinner spinner-sm"></span><div>Passeport ${k + 1}/${files.length} — ${esc(file.name)} : ${s}</div>`; };
+      say('lecture de la bande MRZ…');
+      let r = null;
+      try { r = await readPassport(file, n => say(`lecture de la bande MRZ (essai ${n})…`)); } catch (e) { console.warn(e); }
+      if (r?.fields.doc_no && known.has(r.fields.doc_no)) { dup++; continue; }
+      try {
+        say('enregistrement…');
+        const up = await api.uploadPrivate(file, `passports/${c.id}`);
+        const g = { ...(r ? r.fields : {}), mrz_ok: !!r?.ok, order: order++, ...(emb || {}) };
+        await api.insert('charter_documents', { charter_id: c.id, folder: 'guests', title: [g.family, g.given].filter(Boolean).join(' ') || file.name, note: JSON.stringify(g), ...up });
+        if (g.doc_no) known.add(g.doc_no);
+        ok++; if (!r?.ok) unsure++;
+      } catch (e) { toast(`${file.name} : ${errMsg(e)}`, 'err'); }
+    }
+    await reload(); route();
+    if (ok) toast(`${ok} passager${ok > 1 ? 's' : ''} ajouté${ok > 1 ? 's' : ''}${unsure ? ` — ${unsure} à vérifier` : ''}`, unsure ? 'err' : 'ok');
+    if (dup) toast(`${dup} passeport${dup > 1 ? 's' : ''} déjà dans la liste`, 'err');
+  }
+  const clampDate = (d, c) => { if (c.start_date && d < c.start_date) return c.start_date; if (c.end_date && d > c.end_date) return c.end_date; return d; };
+  const stopFields = (p, c, label) => `
+    <label class="field"><span>Date</span><input type="date" name="date" required value="${esc(p.date || '')}" min="${esc(c.start_date || '')}" max="${esc(c.end_date || '')}"></label>
+    <label class="field"><span>Port ou mouillage ${label}</span><input name="port" required value="${esc(p.port || '')}" placeholder="ex. Portofino"></label>
+    <label class="field"><span>Pays</span><input name="country" required list="dl-countries" value="${esc(p.country || '')}" placeholder="ex. Italy"></label>`;
+  ACTIONS['guest-embark'] = () => {
+    const c = charterById(CURRENT), M = guestMeta(c);
+    const m = openModal({ title: 'Embark — passagers qui montent à bord', wide: true,
+      body: `<form class="form-grid" id="f-emb">${stopFields({ date: clampDate(today(), c), country: M.dis_country || M.emb_country }, c, 'd’embarquement')}
+        <label class="field span-2"><span>Passeports des nouveaux passagers <small>(photo ou PDF, un par passager)</small></span><input type="file" name="files" multiple accept="image/*,application/pdf,.heic"></label>
+        <p class="muted small span-2">Sans passeport, les passagers s’ajoutent ensuite un par un avec « Ajouter à la main ».</p></form>${countryDatalist()}
+        <div id="emb-progress" class="banner banner-info" hidden></div>`,
+      footer: `<button class="btn btn-ghost" data-close>Annuler</button><button class="btn btn-primary" data-ok>Embark</button>` });
+    $('[data-ok]', m).onclick = async ev => {
+      const f = $('#f-emb', m); if (!f.reportValidity()) return; busy(ev.currentTarget, true);
+      const emb = { emb_date: f.date.value, emb_port: f.port.value.trim(), emb_country: f.country.value.trim() };
+      const files = [...f.files.files];
+      if (files.length) { await addPassports(c, files, emb, $('#emb-progress', m)); closeModal(); }
+      else { closeModal(); guestModal(c, null, emb); }
+    };
+  };
+  ACTIONS['guest-disembark'] = () => {
+    const c = charterById(CURRENT), V = voyageOf(c), d0 = clampDate(today(), c);
+    const m = openModal({ title: 'Disembark — passagers qui quittent le bord', wide: true,
+      body: `<form class="form-grid" id="f-dis">${stopFields({ date: d0, country: V.M.dis_country || V.M.emb_country }, c, 'de débarquement')}
+        <div class="span-2"><p class="small"><b>Qui débarque définitivement ?</b></p>
+        ${V.G.map(x => { const mv = guestMoves(c, x.g, V.M); return `<label class="check"><input type="checkbox" name="g" value="${x.d.id}"> <span><b>${esc(x.g.family || '')}</b> ${esc(x.g.given || '')}
+          <small class="muted">— à bord ${fdate(mv.emb.date).slice(0, 5)} → ${fdate(mv.dis.date).slice(0, 5)} ${esc(mv.dis.port || '')}</small></span></label>`; }).join('')}</div></form>${countryDatalist()}`,
+      footer: `<button class="btn btn-ghost" data-close>Annuler</button><button class="btn btn-primary" data-ok>Disembark</button>` });
+    $('[data-ok]', m).onclick = async ev => {
+      const f = $('#f-dis', m); if (!f.reportValidity()) return;
+      const ids = $$('input[name=g]:checked', f).map(i => i.value);
+      if (!ids.length) { toast('Cochez au moins un passager', 'err'); return; }
+      busy(ev.currentTarget, true);
+      try {
+        for (const id of ids) { const x = V.G.find(y => y.d.id === id);
+          const g = { ...x.g, dis_date: f.date.value, dis_port: f.port.value.trim(), dis_country: f.country.value.trim() };
+          await api.update('charter_documents', id, { note: JSON.stringify(g) }); }
+        await reload(); closeModal(); route(); toast(`${ids.length} passager${ids.length > 1 ? 's' : ''} débarqué${ids.length > 1 ? 's' : ''}`);
+      } catch (e) { toast(errMsg(e), 'err'); busy(ev.currentTarget, false); }
+    };
+  };
+
+  ACTIONS['guest-file'] = async b => {
+    const d = (S.charter_documents || []).find(x => x.id === b.dataset.id); if (!d?.file_path) return;
+    const w = window.open('', '_blank');
+    try { const url = await api.privateUrl(d.file_path); if (w) w.location.href = url; else location.href = url; }
+    catch (e) { if (w) w.close(); toast(errMsg(e), 'err'); }
+  };
+  ACTIONS['guest-del'] = async b => {
+    const d = (S.charter_documents || []).find(x => x.id === b.dataset.id); if (!d) return;
+    if (!(await confirmDialog(`Supprimer <b>${esc(d.title || 'ce passager')}</b> et le scan de son passeport ?`, 'Supprimer'))) return;
+    try { await api.remove('charter_documents', d.id); if (d.file_path) await api.removeFile(d.file_path).catch(() => {}); await reload(); route(); toast('Passager supprimé'); }
+    catch (e) { toast(errMsg(e), 'err'); }
+  };
+  ACTIONS['guest-purge'] = async () => {
+    const c = charterById(CURRENT); const withFile = guestsOf(c).filter(x => x.d.file_path);
+    if (!withFile.length || !(await confirmDialog(`Effacer définitivement les ${withFile.length} scan(s) de passeport de ce charter ? La liste des passagers est conservée.`, 'Effacer'))) return;
+    try { for (const { d } of withFile) { await api.removeFile(d.file_path).catch(() => {}); await api.update('charter_documents', d.id, { file_path: null, file_name: null }); }
+      await reload(); route(); toast('Scans effacés'); }
+    catch (e) { toast(errMsg(e), 'err'); }
+  };
+  ACTIONS['guest-edit'] = b => {
+    const c = charterById(CURRENT), d = b.dataset.id ? (S.charter_documents || []).find(x => x.id === b.dataset.id) : null;
+    guestModal(c, d);
+  };
+  function guestModal(c, d, preset = {}) {
+    const g = { ...(d ? parseNote(d) : {}), ...preset }, M = guestMeta(c), mv = guestMoves(c, g, M);
+    const isImg = d?.file_name && /\.(jpe?g|png|webp|heic|gif)$/i.test(d.file_name);
+    const opt = (v, cur, l = v) => `<option value="${esc(v)}" ${v === cur ? 'selected' : ''}>${esc(l)}</option>`;
+    const m = openModal({ title: d ? 'Fiche passager' : 'Nouveau passager', wide: true,
+      body: `${d && !g.mrz_ok && !g.checked ? `<div class="banner banner-gold">${ICON.eye}<div>Lecture automatique incertaine : comparez chaque champ avec le passeport.</div></div>` : ''}
+        ${isImg ? `<div class="guest-scan"><img id="guest-img" alt="Passeport"></div>` : ''}
+        <form class="form-grid" id="f-guest">
+          <label class="field"><span>5. Nom de famille</span><input name="family" required value="${esc(g.family || '')}" autocapitalize="characters"></label>
+          <label class="field"><span>6. Prénoms</span><input name="given" value="${esc(g.given || '')}"></label>
+          <label class="field"><span>7. Nationalité</span><input name="nationality" list="dl-countries" value="${esc(g.nationality || '')}"></label>
+          <label class="field"><span>10. Sexe</span><select name="gender">${opt('', g.gender || '', '—')}${Object.entries(GENDERS).map(([k, l]) => opt(k, g.gender || '', l)).join('')}</select></label>
+          <label class="field"><span>8. Date de naissance</span><input type="date" name="dob" value="${esc(g.dob || '')}"></label>
+          <label class="field"><span>9. Lieu de naissance</span><input name="pob" value="${esc(g.pob || '')}" placeholder="ex. Paris"></label>
+          <label class="field"><span>11. Type de document</span><select name="doc_type">${DOC_TYPES.map(t => opt(t, g.doc_type || 'Passport')).join('')}</select></label>
+          <label class="field"><span>12. N° du document</span><input name="doc_no" value="${esc(g.doc_no || '')}" autocapitalize="characters"></label>
+          <label class="field"><span>13. État émetteur</span><input name="issuing" list="dl-countries" value="${esc(g.issuing || '')}"></label>
+          <label class="field"><span>14. Date d’expiration</span><input type="date" name="expiry" value="${esc(g.expiry || '')}"></label>
+          <label class="field"><span>16. N° de visa <small>(si nécessaire)</small></span><input name="visa" value="${esc(g.visa || '')}"></label>
+          <label class="check"><input type="checkbox" name="transit" ${g.transit ? 'checked' : ''}><span>18. Passager en transit</span></label>
+          <div class="field-sep span-2">Embarquement <small class="muted">(vide = début du charter : ${fdate(c.start_date)} ${esc(M.port_emb || '')})</small></div>
+          <label class="field"><span>Date</span><input type="date" name="emb_date" value="${esc(g.emb_date || '')}" min="${esc(c.start_date || '')}" max="${esc(c.end_date || '')}"></label>
+          <label class="field"><span>15. Port d’embarquement</span><input name="emb_port" value="${esc(g.emb_port || g.port_emb || '')}" placeholder="${esc(M.port_emb || '')}"></label>
+          <label class="field"><span>Pays</span><input name="emb_country" list="dl-countries" value="${esc(g.emb_country || '')}" placeholder="${esc(M.emb_country || '')}"></label>
+          <div class="field-sep span-2">Débarquement <small class="muted">(vide = fin du charter : ${fdate(c.end_date)} ${esc(M.port_dis || '')})</small></div>
+          <label class="field"><span>Date</span><input type="date" name="dis_date" value="${esc(g.dis_date || '')}" min="${esc(c.start_date || '')}" max="${esc(c.end_date || '')}"></label>
+          <label class="field"><span>17. Port de débarquement</span><input name="dis_port" value="${esc(g.dis_port || g.port_dis || '')}" placeholder="${esc(M.port_dis || '')}"></label>
+          <label class="field"><span>Pays</span><input name="dis_country" list="dl-countries" value="${esc(g.dis_country || '')}" placeholder="${esc(M.dis_country || '')}"></label>
+          ${d ? '' : `<label class="field span-2"><span>Scan du passeport <small>(facultatif)</small></span><input type="file" name="file" accept="image/*,application/pdf,.heic"></label>`}
+          <label class="check span-2"><input type="checkbox" name="checked" ${g.checked || !d ? 'checked' : ''}><span>J’ai vérifié ces informations avec le passeport</span></label>
+        </form>${countryDatalist()}`,
+      footer: `<button class="btn btn-ghost" data-close>Annuler</button><button class="btn btn-primary" data-ok>Enregistrer</button>` });
+    if (isImg) api.privateUrl(d.file_path).then(u => { const im = $('#guest-img', m); if (im) im.src = u; }).catch(() => { const w = $('.guest-scan', m); if (w) w.remove(); });
+    $('[data-ok]', m).onclick = async ev => {
+      const f = $('#f-guest', m); if (!f.reportValidity()) return; busy(ev.currentTarget, true);
+      const fd = new FormData(f), file = fd.get('file');
+      const v = k => String(fd.get(k) || '').trim();
+      const { port_emb, port_dis, ...rest } = g; // eslint-disable-line no-unused-vars
+      const ng = { ...rest, family: v('family').toUpperCase(), given: v('given'), nationality: v('nationality'), gender: v('gender'), dob: v('dob'),
+        pob: v('pob'), doc_type: v('doc_type'), doc_no: v('doc_no').toUpperCase().replace(/\s+/g, ''), issuing: v('issuing'), expiry: v('expiry'),
+        visa: v('visa'), transit: !!fd.get('transit'), checked: !!fd.get('checked'),
+        emb_date: v('emb_date'), emb_port: v('emb_port'), emb_country: v('emb_country'), dis_date: v('dis_date'), dis_port: v('dis_port'), dis_country: v('dis_country') };
+      if (ng.emb_date && ng.dis_date && ng.dis_date < ng.emb_date) { toast('Le débarquement doit être après l’embarquement', 'err'); busy(ev.currentTarget, false); return; }
+      if (!d) ng.order = Math.max(0, ...guestsOf(c).map(x => x.g.order ?? 0)) + 1;
+      const row = { title: [ng.family, ng.given].filter(Boolean).join(' '), note: JSON.stringify(ng) };
+      try {
+        if (file && file.size) Object.assign(row, await api.uploadPrivate(file, `passports/${c.id}`));
+        d ? await api.update('charter_documents', d.id, row) : await api.insert('charter_documents', { charter_id: c.id, folder: 'guests', ...row });
+        await reload(); closeModal(); route(); toast('Passager enregistré');
+      } catch (e) { toast(errMsg(e), 'err'); busy(ev.currentTarget, false); }
+    };
+  }
+
+  // ---- Export : IMO FAL Form 6 (PDF A4 paysage, 12 passagers par page) et Excel, pour un départ ou une arrivée donnés
+  function falPoints(c) {
+    const V = voyageOf(c), pts = [];
+    V.stops.forEach((s, i) => {
+      const before = i > 0 ? V.onBoardAfter(i - 1) : [], after = V.onBoardAfter(i);
+      if (before.length) pts.push({ direction: 'arrival', port: s.port, date: s.date, guests: before, label: `Arrival — ${fdate(s.date)} ${s.port || ''} (${before.length} pax)` });
+      if (after.length) pts.push({ direction: 'departure', port: s.port, date: s.date, guests: after, label: `Departure — ${fdate(s.date)} ${s.port || ''} (${after.length} pax)` });
+    });
+    return pts;
+  }
+  function falRows(c, guests) {
+    const M = guestMeta(c);
+    return guests.map(({ g }) => { const mv = guestMoves(c, g, M);
+      return [g.family || '', g.given || '', g.nationality || '', fdate(g.dob), g.pob || '', GENDERS[g.gender] || g.gender || '',
+        g.doc_type || '', g.doc_no || '', g.issuing || '', fdate(g.expiry), mv.emb.port || '', g.visa || '', mv.dis.port || '', g.transit ? 'Yes' : 'No']; });
+  }
+  const FAL_HEAD = ['5. Family name', '6. Given names', '7. Nationality', '8. Date of birth', '9. Place of birth', '10. Gender', '11. Type of identity or travel document',
+    '12. Serial number of identity or travel document', '13. Issuing State of identity or travel document', '14. Expiry date of identity or travel document',
+    '15. Port of embarkation', '16. Visa number if appropriate', '17. Port of disembarkation', '18. Transit passenger or not'];
+  async function fal6Pdf(c, pt) {
+    await loadScript(JSPDF_JS);
+    const { jsPDF } = window.jspdf, doc = new jsPDF({ unit: 'mm', format: 'a4', orientation: 'landscape' });
+    const M = guestMeta(c), P = PROFILE, rows = falRows(c, pt.guests), PER = 12, pages = Math.max(1, Math.ceil(rows.length / PER));
+    const X0 = 15, W = 267, colW = [22, 24, 20, 16, 20, 13, 18, 20, 18, 17, 20, 16, 20, 23];
+    const label = (t, x, y, w) => { doc.setFont('helvetica', 'normal'); doc.setFontSize(6.5); doc.text(doc.splitTextToSize(pdfText(t), w - 2), x + 1, y + 3); };
+    const value = (t, x, y, w) => { doc.setFont('helvetica', 'bold'); doc.setFontSize(9); doc.text(doc.splitTextToSize(pdfText(t), w - 2)[0] || '', x + 1.5, y + 8.5); };
+    const box = (x, y, on) => { doc.rect(x, y, 6, 6); if (on) { doc.setFont('helvetica', 'bold'); doc.setFontSize(10); doc.text('X', x + 3, y + 4.6, { align: 'center' }); } doc.setFont('helvetica', 'normal'); doc.setFontSize(8); };
+    for (let p = 0; p < pages; p++) {
+      if (p) doc.addPage();
+      doc.setDrawColor(0); doc.setTextColor(0); doc.setLineWidth(0.25);
+      doc.setFont('helvetica', 'bold'); doc.setFontSize(12); doc.text('PASSENGER LIST', 148.5, 14, { align: 'center' });
+      doc.setFont('helvetica', 'normal'); doc.setFontSize(10); doc.text('(IMO FAL Form 6)', 148.5, 19, { align: 'center' });
+      box(148, 23, pt.direction === 'arrival'); doc.text('Arrival', 156, 27.5);
+      box(178, 23, pt.direction !== 'arrival'); doc.text('Departure', 186, 27.5);
+      doc.rect(210, 23, 10, 6); doc.setFont('helvetica', 'bold'); doc.text(`${p + 1}/${pages}`, 215, 27.5, { align: 'center' });
+      doc.setFont('helvetica', 'normal'); doc.text('Page Number', 223, 27.5);
+      let y = 31;
+      const r1 = [[0.37, '1.1 Name of ship', BOAT?.name || YACHT], [0.235, '1.2 IMO number', P.imo], [0.395, '1.3 Call sign', P.call_sign]];
+      const r2 = [[0.195, '1.4 Voyage number', M.voyage], [0.25, '2. Port of arrival/departure', pt.port], [0.16, '3. Date of arrival/departure', fdate(pt.date)], [0.395, '4. Flag State of ship', P.flag_state]];
+      for (const r of [r1, r2]) { let x = X0; for (const [k, l, v] of r) { const w = W * k; doc.rect(x, y, w, 11); label(l, x, y, w); value(v || '', x, y, w); x += w; } y += 11; }
+      let x = X0; const hH = 15;
+      FAL_HEAD.forEach((h, i) => { doc.rect(x, y, colW[i], hH); label(h, x, y, colW[i]); x += colW[i]; });
+      y += hH;
+      const chunk = rows.slice(p * PER, p * PER + PER);
+      for (let i = 0; i < PER; i++) {
+        const cells = chunk[i] || null; doc.setFont('helvetica', 'normal'); doc.setFontSize(7);
+        const lines = cells ? cells.map((v, j) => doc.splitTextToSize(pdfText(v), colW[j] - 1.6).slice(0, 2)) : [];
+        const h = Math.max(7.5, cells ? Math.max(...lines.map(l => l.length)) * 3 + 2.2 : 7.5);
+        x = X0; colW.forEach((w, j) => { doc.rect(x, y, w, h); if (cells) doc.text(lines[j], x + 0.8, y + 3.6); x += w; });
+        y += h;
+      }
+      doc.rect(X0, y, W, 16); label('19. Date and signature by master, authorized agent or officer', X0, y, W);
+      doc.setFont('helvetica', 'bold'); doc.setFontSize(9);
+      doc.text(pdfText([fdate(pt.date || today()), M.master].filter(Boolean).join('   —   ')), X0 + 2, y + 10);
+    }
+    saveBlob(doc.output('blob'), `Passenger_List_FAL6_${pt.direction === 'arrival' ? 'Arrival' : 'Departure'}_${safeName(pt.port || '')}_${pt.date || ''}.pdf`);
+  }
+  function fal6Xlsx(c, pt) {
+    const M = guestMeta(c), P = PROFILE;
+    const aoa = [['PASSENGER LIST (IMO FAL Form 6)'], [pt.direction === 'arrival' ? 'Arrival' : 'Departure'],
+      ['1.1 Name of ship', BOAT?.name || YACHT, '1.2 IMO number', P.imo || '', '1.3 Call sign', P.call_sign || ''],
+      ['1.4 Voyage number', M.voyage || '', '2. Port of arrival/departure', pt.port || '', '3. Date of arrival/departure', fdate(pt.date), '4. Flag State of ship', P.flag_state || ''],
+      [], ['No.', ...FAL_HEAD], ...falRows(c, pt.guests).map((r, i) => [i + 1, ...r]), [],
+      ['19. Date and signature by master, authorized agent or officer', [fdate(pt.date || today()), M.master].filter(Boolean).join(' — ')]];
+    const X = window.XLSX, ws = X.utils.aoa_to_sheet(aoa);
+    ws['!cols'] = [{ wch: 5 }, ...[18, 20, 16, 12, 16, 8, 14, 16, 16, 12, 16, 12, 16, 10].map(w => ({ wch: w }))];
+    const wb = X.utils.book_new(); X.utils.book_append_sheet(wb, ws, 'FAL 6');
+    saveBlob(new Blob([X.write(wb, { type: 'array', bookType: 'xlsx' })], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' }),
+      `Passenger_List_FAL6_${pt.direction === 'arrival' ? 'Arrival' : 'Departure'}_${safeName(pt.port || '')}_${pt.date || ''}.xlsx`);
+  }
+  // Choix du départ / de l'arrivée à éditer (direct s'il n'y en a qu'un)
+  function pickFalPoint(c, kind) {
+    const pts = falPoints(c);
+    const run = async (pt, btn) => {
+      busy(btn, true);
+      try { if (kind === 'pdf') await fal6Pdf(c, pt); else { await loadScript(XLSX_JS); fal6Xlsx(c, pt); } closeModal(); }
+      catch (e) { toast(errMsg(e), 'err'); } finally { busy(btn, false); }
+    };
+    if (!pts.length) return toast('Ajoutez d’abord des passagers', 'err');
+    const m = openModal({ title: `Passenger List (FAL 6) — ${kind === 'pdf' ? 'PDF' : 'Excel'}`,
+      body: `<p class="muted small">Choisissez le départ ou l’arrivée : la liste contient les passagers à bord à ce moment-là.</p>
+        <div class="fal-points">${pts.map((p, i) => `<button class="btn ${p.direction === 'departure' ? 'btn-primary' : 'btn-ghost'} btn-block" data-pt="${i}">${esc(p.label)}</button>`).join('')}</div>` });
+    $$('[data-pt]', m).forEach(b => b.addEventListener('click', () => run(pts[+b.dataset.pt], b)));
+  }
+  ACTIONS['fal6-pdf'] = () => pickFalPoint(charterById(CURRENT), 'pdf');
+  ACTIONS['fal6-xlsx'] = () => pickFalPoint(charterById(CURRENT), 'xlsx');
+
+  // ---------------- VAT Exo FR : trajets hors des eaux territoriales françaises (critère des 70 %) ----------------
+  function vatTrips(year) {
+    const y = String(year);
+    const auto = S.charters.filter(c => String(c.start_date || '').slice(0, 4) === y).flatMap(trajetsOf).map(t => ({ ...t, auto: true }));
+    const manual = (PROFILE.vat_manual || []).filter(t => String(t.date || '').slice(0, 4) === y).map(t => ({ manual: t, key: 'm|' + t.id,
+      from: { date: t.date, port: t.from_port, country: t.from_country }, to: { date: t.date_to || t.date, port: t.to_port, country: t.to_country }, pax: t.pax ?? null, note: t.note }));
+    return [...auto, ...manual].sort((a, b) => String(a.from.date).localeCompare(String(b.from.date)));
+  }
+  const tripOutOf = t => t.manual ? !!t.manual.out : trajetOut(t);
+  const tripAuto = t => !!(t.from.country && !isFR(t.from.country)) || !!(t.to.country && !isFR(t.to.country));
+  // Trajet entre deux ports français déclaré hors eaux territoriales : mention + justificatif (relevé AIS, carte ECDIS…)
+  const tripForced = t => tripOutOf(t) && !tripAuto(t);
+  const VAT_MENTION_FR = 'Trajet entre deux ports français : le navire est sorti des eaux territoriales françaises (au-delà de 12 milles nautiques).';
+  const VAT_MENTION_EN = 'Voyage between two French ports: the vessel left French territorial waters (beyond 12 nautical miles).';
+  const tripProofs = t => (PROFILE.vat_proofs || {})[t.key] || [];
+  function viewVat(yearArg) {
+    const years = [...new Set([String(new Date().getFullYear()), ...S.charters.map(c => String(c.start_date || '').slice(0, 4)).filter(Boolean),
+      ...(PROFILE.vat_manual || []).map(t => String(t.date || '').slice(0, 4))])].sort().reverse();
+    const year = yearArg && /^\d{4}$/.test(yearArg) ? yearArg : String(new Date().getFullYear());
+    const trips = vatTrips(year), n = trips.length, out = trips.filter(tripOutOf).length;
+    const pct = n ? Math.round(out / n * 1000) / 10 : 0, ok = n > 0 && pct >= 70;
+    const need = n ? Math.max(0, Math.ceil((0.7 * n - out) / 0.3)) : 0; // trajets hors eaux FR à ajouter pour atteindre 70 %
+    const cap = isCaptain();
+    const flagSel = t => {
+      if (t.manual) return t.manual.out ? '<span class="badge badge-ok">Oui</span>' : '<span class="badge badge-open">Non</span>';
+      const f = (PROFILE.vat_flags || {})[t.key], a = trajetAuto(t);
+      return `<select class="vat-flag" data-key="${esc(t.key)}" ${cap ? '' : 'disabled'}>
+        <option value="" ${f == null ? 'selected' : ''}>Auto : ${a ? 'oui' : 'non'}</option>
+        <option value="1" ${f === true ? 'selected' : ''}>Oui</option><option value="0" ${f === false ? 'selected' : ''}>Non</option></select>`;
+    };
+    const edit = isCaptain();
+    const proofCell = t => {
+      const files = tripProofs(t), forced = tripForced(t);
+      if (!forced && !files.length) return '';
+      return `<div class="vat-proof">
+        ${forced ? `<div class="vat-mention"><span lang="fr">${esc(VAT_MENTION_FR)}</span><span lang="en">${esc(VAT_MENTION_EN)}</span></div>` : ''}
+        ${files.map(f => `<div class="row-gap"><button class="link-btn" data-act="vat-proof-view" data-path="${esc(f.path)}">${ICON.file}${esc(f.name)}</button>
+          ${edit ? `<button class="icon-btn danger" data-act="vat-proof-del" data-key="${esc(t.key)}" data-path="${esc(f.path)}" title="Retirer">${ICON.trash}</button>` : ''}</div>`).join('')}
+        ${forced && !files.length ? '<span class="chip chip-warn">Justificatif à joindre</span>' : ''}
+        ${edit ? `<label class="btn btn-ghost btn-xs file-btn">${ICON.plus}Joindre (AIS, ECDIS…)<input type="file" multiple class="sr-file vat-proof-in" data-key="${esc(t.key)}" accept="image/*,application/pdf,.heic"></label>` : ''}</div>`;
+    };
+    const missingProofs = trips.filter(t => tripForced(t) && !tripProofs(t).length).length;
+    $('#app').innerHTML = shell('vat', `
+      <div class="page-head"><div><div class="eyebrow">Exonération de TVA · navigation en haute mer</div><h1>VAT Exo FR ${year}</h1>
+        <p class="muted">Trajets de l’année civile ${year} : le taux obtenu conditionne l’exonération pour ${+year + 1}.</p></div>
+        <div class="head-actions">
+          <select class="vat-year" aria-label="Année">${years.map(y => `<option ${y === year ? 'selected' : ''}>${y}</option>`).join('')}</select>
+          <button class="btn btn-ghost" data-act="vat-xlsx">${ICON.sheet}Excel</button>
+          ${edit ? `<button class="btn btn-ghost" data-act="vat-zip">${ICON.folder}Dossier complet (.zip)</button>` : ''}
+          <button class="btn btn-primary" data-act="vat-add">${ICON.plus}Ajouter un trajet</button></div></div>
+      <div class="kpis kpis-3">
+        <div class="kpi"><div class="kpi-label">Trajets</div><div class="kpi-value">${n}</div><div class="kpi-sub">${S.charters.filter(c => String(c.start_date || '').slice(0, 4) === year).length} charter(s)</div></div>
+        <div class="kpi"><div class="kpi-label">Hors eaux territoriales FR</div><div class="kpi-value">${out}</div><div class="kpi-sub">${n - out} dans les eaux françaises</div></div>
+        <div class="kpi ${n ? (ok ? 'kpi-balance is-pos' : 'kpi-balance is-neg') : ''}"><div class="kpi-label">Taux</div><div class="kpi-value">${n ? fmt(pct, pct % 1 ? 1 : 0) + ' %' : '—'}</div>
+          <div class="kpi-sub">${!n ? 'aucun trajet' : ok ? 'seuil de 70 % atteint' : `il manque ${need} trajet${need > 1 ? 's' : ''} hors eaux FR`}</div></div>
+      </div>
+      <div class="vat-meter" role="img" aria-label="${fmt(pct, 1)} % des trajets hors eaux françaises"><div class="vat-fill ${ok ? 'ok' : ''}" style="width:${Math.min(100, pct)}%"></div><div class="vat-mark" style="left:70%"><span>70 %</span></div></div>
+      ${missingProofs ? `<div class="banner banner-gold">${ICON.eye}<div><b>${missingProofs} trajet${missingProofs > 1 ? 's' : ''} entre ports français</b> déclaré${missingProofs > 1 ? 's' : ''} hors eaux territoriales sans justificatif : joignez une photo du relevé AIS ou de la carte ECDIS montrant le passage au-delà des 12 milles.</div></div>` : ''}
+      <section class="panel">
+        <div class="panel-head"><h2>Trajets</h2></div>
+        <p class="muted small">Un charter compte pour <b>un seul trajet</b>, sauf si des passagers montent ou descendent définitivement en escale (boutons Embark / Disembark de la Guest List) : chaque escale crée alors un trajet. « Auto » met <b>oui</b> quand le départ ou l’arrivée est hors de France. Choisissez <b>Oui</b> pour un trajet entre deux ports français pendant lequel le bateau est sorti des eaux territoriales (au-delà de 12 milles des côtes) : gardez la trace AIS ou GPS comme preuve.</p>
+        ${n ? `<div class="table-wrap"><table class="table table-cards table-compact"><thead><tr><th>Date</th><th>Charter</th><th>Départ</th><th>Arrivée</th><th class="num">Pax</th><th>Sorti des eaux FR</th><th>Mention & justificatif</th><th></th></tr></thead><tbody>
+          ${trips.map(t => `<tr><td data-label="Date"><div>${fdate(t.from.date)}${t.to.date && t.to.date !== t.from.date ? ` → ${fdate(t.to.date)}` : ''}</div></td>
+            <td data-label="Charter"><div>${t.c ? `<a href="#/charter/${t.c.id}/guests">${esc(t.c.title)}</a>` : `<i>Saisi à la main</i>${t.note ? `<br><small class="muted">${esc(t.note)}</small>` : ''}`}</div></td>
+            <td data-label="Départ"><div>${stopLabel(t.from)}</div></td><td data-label="Arrivée"><div>${stopLabel(t.to)}</div></td>
+            <td data-label="Pax" class="num"><div>${t.pax ?? '—'}</div></td><td data-label="Hors eaux FR"><div>${flagSel(t)}</div></td>
+            <td data-label="Justificatif"><div>${proofCell(t)}</div></td>
+            <td class="actions"><div class="row-gap" style="justify-content:flex-end">${t.manual ? `<button class="icon-btn" data-act="vat-add" data-id="${t.manual.id}" title="Modifier">${ICON.edit}</button><button class="icon-btn danger" data-act="vat-del" data-id="${t.manual.id}" title="Supprimer">${ICON.trash}</button>` : ''}</div></td></tr>`).join('')}
+          </tbody></table></div>` : `<div class="empty-state"><p class="muted">Aucun trajet en ${year}. Les charters de l’année apparaissent ici automatiquement.</p></div>`}
+      </section>
+      <section class="panel">
+        <div class="panel-head"><h2>La règle</h2></div>
+        <ul class="small vat-rules">
+          <li>L’exonération de TVA (art. 262 II du CGI) vise les navires de commerce qui effectuent <b>au moins 70 % de leurs trajets en dehors des eaux territoriales françaises</b>, en plus des autres conditions (immatriculation au commerce, équipage permanent, activité commerciale).</li>
+          <li>Un <b>trajet</b> est une navigation commerciale entre deux ports ou mouillages, avec embarquement ou débarquement de passagers. Les convoyages, essais en mer ou passages au chantier ne comptent pas.</li>
+          <li>Un trajet compte comme hors eaux FR dès que le bateau <b>sort des eaux territoriales françaises</b> (12 milles) : France → Italie, Italie → Grèce ou Cannes → Saint-Tropez par le large comptent tous.</li>
+          <li>Le taux se calcule sur l’<b>année civile</b> et vaut pour l’année suivante. Sous 70 %, l’exonération cesse au 1er janvier suivant.</li>
+          <li>Preuves : journal de bord, traces GPS ou AIS. La location à quai doit rester inférieure à la moitié des contrats de l’année.</li>
+        </ul>
+        <p class="muted small">Calcul indicatif, à valider avec votre représentant fiscal.</p>
+      </section>`);
+    $('.vat-year').addEventListener('change', e => { location.hash = '#/vat/' + e.target.value; });
+    $$('.vat-proof-in').forEach(inp => inp.addEventListener('change', async () => {
+      const files = [...inp.files]; if (!files.length) return;
+      const lab = inp.closest('label'); busy(lab, true); lab.classList.add('is-busy');
+      try {
+        const added = [];
+        for (const f of files) { const up = await api.uploadPrivate(f, `vat/${year}`); added.push({ path: up.file_path, name: f.name, at: new Date().toISOString() }); }
+        const proofs = { ...(PROFILE.vat_proofs || {}) }; proofs[inp.dataset.key] = [...(proofs[inp.dataset.key] || []), ...added];
+        await api.saveBoat({ profile: { ...PROFILE, vat_proofs: proofs } }); await reload(); route();
+        toast(added.length > 1 ? `${added.length} justificatifs joints` : 'Justificatif joint');
+      } catch (e) { toast(errMsg(e), 'err'); lab.classList.remove('is-busy'); }
+    }));
+    $$('.vat-flag').forEach(sel => sel.addEventListener('change', async () => {
+      const flags = { ...(PROFILE.vat_flags || {}) };
+      if (sel.value === '') delete flags[sel.dataset.key]; else flags[sel.dataset.key] = sel.value === '1';
+      try { await api.saveBoat({ profile: { ...PROFILE, vat_flags: flags } }); await reload(); route(); }
+      catch (e) { toast(errMsg(e), 'err'); }
+    }));
+  }
+  ACTIONS['vat-add'] = b => {
+    const t = b.dataset.id ? (PROFILE.vat_manual || []).find(x => x.id === b.dataset.id) : null;
+    const m = openModal({ title: t ? 'Modifier le trajet' : 'Ajouter un trajet', wide: true,
+      body: `<p class="muted small">Pour un trajet commercial qui n’est pas un charter de l’app (day charter, transfert de passagers…).</p>
+        <form class="form-grid" id="f-vat">
+          <label class="field"><span>Date de départ</span><input type="date" name="date" required value="${esc(t?.date || today())}"></label>
+          <label class="field"><span>Date d’arrivée</span><input type="date" name="date_to" value="${esc(t?.date_to || '')}"></label>
+          <label class="field"><span>Port de départ</span><input name="from_port" required value="${esc(t?.from_port || '')}"></label>
+          <label class="field"><span>Pays</span><input name="from_country" list="dl-countries" value="${esc(t?.from_country || 'France')}"></label>
+          <label class="field"><span>Port d’arrivée</span><input name="to_port" required value="${esc(t?.to_port || '')}"></label>
+          <label class="field"><span>Pays</span><input name="to_country" list="dl-countries" value="${esc(t?.to_country || 'France')}"></label>
+          <label class="field"><span>Passagers</span><input type="number" min="0" name="pax" value="${esc(t?.pax ?? '')}"></label>
+          <label class="field"><span>Note</span><input name="note" value="${esc(t?.note || '')}" placeholder="ex. day charter"></label>
+          <label class="check span-2"><input type="checkbox" name="out" ${t?.out ? 'checked' : ''}><span>Le bateau est sorti des eaux territoriales françaises</span></label>
+          <p class="muted small span-2">Entre deux ports français, joignez ensuite le relevé AIS ou la carte ECDIS dans la colonne « Mention & justificatif ».</p>
+        </form>${countryDatalist()}`,
+      footer: `<button class="btn btn-ghost" data-close>Annuler</button><button class="btn btn-primary" data-ok>Enregistrer</button>` });
+    const f = $('#f-vat', m);
+    const auto = () => { if (!isFR(f.from_country.value) || !isFR(f.to_country.value)) f.out.checked = true; };
+    f.from_country.addEventListener('change', auto); f.to_country.addEventListener('change', auto);
+    $('[data-ok]', m).onclick = async ev => {
+      if (!f.reportValidity()) return; busy(ev.currentTarget, true);
+      const v = k => f[k].value.trim();
+      const row = { id: t?.id || uuid(), date: v('date'), date_to: v('date_to'), from_port: v('from_port'), from_country: v('from_country'),
+        to_port: v('to_port'), to_country: v('to_country'), pax: toNum(v('pax')), note: v('note'), out: f.out.checked };
+      const list = (PROFILE.vat_manual || []).filter(x => x.id !== row.id).concat(row);
+      try { await api.saveBoat({ profile: { ...PROFILE, vat_manual: list } }); await reload(); closeModal(); location.hash = '#/vat/' + row.date.slice(0, 4); route(); toast('Trajet enregistré'); }
+      catch (e) { toast(errMsg(e), 'err'); busy(ev.currentTarget, false); }
+    };
+  };
+  ACTIONS['vat-del'] = async b => {
+    if (!(await confirmDialog('Supprimer ce trajet ?', 'Supprimer'))) return;
+    try { await api.saveBoat({ profile: { ...PROFILE, vat_manual: (PROFILE.vat_manual || []).filter(x => x.id !== b.dataset.id) } }); await reload(); route(); toast('Trajet supprimé'); }
+    catch (e) { toast(errMsg(e), 'err'); }
+  };
+  ACTIONS['vat-proof-view'] = async b => {
+    const w = window.open('', '_blank');
+    try { const url = await api.privateUrl(b.dataset.path); if (w) w.location.href = url; else location.href = url; }
+    catch (e) { if (w) w.close(); toast(errMsg(e), 'err'); }
+  };
+  ACTIONS['vat-proof-del'] = async b => {
+    if (!(await confirmDialog('Retirer ce justificatif ?', 'Retirer'))) return;
+    const proofs = { ...(PROFILE.vat_proofs || {}) }, k = b.dataset.key;
+    proofs[k] = (proofs[k] || []).filter(f => f.path !== b.dataset.path); if (!proofs[k].length) delete proofs[k];
+    try { await api.saveBoat({ profile: { ...PROFILE, vat_proofs: proofs } }); await api.removeFile(b.dataset.path).catch(() => {}); await reload(); route(); toast('Justificatif retiré'); }
+    catch (e) { toast(errMsg(e), 'err'); }
+  };
+  const vatYear = () => { const y = location.hash.split('/')[2]; return y && /^\d{4}$/.test(y) ? y : String(new Date().getFullYear()); };
+  const proofName = (t, i, f) => `Preuves/${t.from.date || ''}_${safeName(t.from.port || '')}-${safeName(t.to.port || '')}_${i + 1}${(f.name.match(/\.[a-z0-9]+$/i) || [''])[0].toLowerCase()}`;
+  async function vatWorkbook(year) {
+    await loadScript(XLSX_JS);
+    const trips = vatTrips(year), out = trips.filter(tripOutOf).length;
+    const aoa = [[`${BOAT?.name || YACHT} — trajets ${year} (exonération TVA, critère des 70 %) / voyages ${year} (VAT exemption, 70 % criterion)`], [],
+      ['Date départ / Departure', 'Date arrivée / Arrival', 'Charter', 'Port de départ / From', 'Pays / Country', 'Port d’arrivée / To', 'Pays / Country', 'Passagers / Pax',
+        'Sorti des eaux territoriales FR / Left French territorial waters', 'Mention', 'Justificatifs / Evidence'],
+      ...trips.map(t => [fdate(t.from.date), fdate(t.to.date), t.c ? t.c.title : (t.note || 'Saisi à la main'), t.from.port || '', t.from.country || '', t.to.port || '', t.to.country || '', t.pax ?? '',
+        tripOutOf(t) ? 'Oui / Yes' : 'Non / No', tripForced(t) ? `${VAT_MENTION_FR} / ${VAT_MENTION_EN}` : '', tripProofs(t).map((f, i) => proofName(t, i, f)).join(', ')]),
+      [], ['Trajets / Voyages', trips.length], ['Hors eaux territoriales FR / Outside French territorial waters', out],
+      ['Taux / Rate', trips.length ? Math.round(out / trips.length * 1000) / 10 + ' %' : '—']];
+    const X = window.XLSX, ws = X.utils.aoa_to_sheet(aoa); ws['!cols'] = [12, 12, 28, 18, 12, 18, 12, 10, 16, 60, 40].map(w => ({ wch: w }));
+    const wb = X.utils.book_new(); X.utils.book_append_sheet(wb, ws, `Trajets ${year}`);
+    return { data: X.write(wb, { type: 'array', bookType: 'xlsx' }), trips };
+  }
+  ACTIONS['vat-xlsx'] = async () => {
+    try { const y = vatYear(), { data } = await vatWorkbook(y);
+      saveBlob(new Blob([data], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' }), `VAT_Exo_FR_trajets_${y}.xlsx`); }
+    catch (e) { toast(errMsg(e), 'err'); }
+  };
+  // Dossier pour l'administration : tableau des trajets + tous les justificatifs
+  ACTIONS['vat-zip'] = async b => {
+    busy(b, true);
+    try {
+      await loadScript(JSZIP_JS);
+      const y = vatYear(), { data, trips } = await vatWorkbook(y), zip = new window.JSZip();
+      zip.file(`VAT_Exo_FR_trajets_${y}.xlsx`, data);
+      let missing = 0;
+      for (const t of trips) for (const [i, f] of tripProofs(t).entries()) {
+        try { const r = await fetch(await api.privateUrl(f.path)); if (!r.ok) throw 0; zip.file(proofName(t, i, f), await r.blob()); } catch { missing++; }
+      }
+      saveBlob(await zip.generateAsync({ type: 'blob' }), `VAT_Exo_FR_${safeName(BOAT?.name || YACHT)}_${y}.zip`);
+      if (missing) toast(`${missing} justificatif(s) n’ont pas pu être ajoutés`, 'err');
+    } catch (e) { toast(errMsg(e), 'err'); }
+    finally { busy(b, false); }
+  };
+
   // ---------------- Dossiers Preference list / Itinerary ----------------
   function viewCharterFolder(c, tab) {
     if (tab === 'day') return viewDayProgram(c);
+    if (tab === 'guests') return viewGuestList(c);
     const [, label, sub] = FOLDERS.find(f => f[0] === tab);
     const docs = (S.charter_documents || []).filter(d => d.charter_id === c.id && d.folder === tab)
       .sort((a, b) => String(b.created_at || '').localeCompare(String(a.created_at || '')));
@@ -3102,13 +3835,13 @@
 
   // ---------------- Détail d'un charter ----------------
   let CURRENT = null;
-  const FOLDERS = [['apa', 'APA', 'Comptabilité'], ['day', 'Programme du jour', 'Jour par jour, repas'], ['preferences', 'Preference list', 'Préférences des invités'], ['itinerary', 'Itinerary', 'Itinéraire']];
+  const FOLDERS = [['apa', 'APA', 'Comptabilité'], ['day', 'Programme du jour', 'Jour par jour, repas'], ['guests', 'Guest List', 'Passeports, FAL 6'], ['preferences', 'Preference list', 'Préférences des invités'], ['itinerary', 'Itinerary', 'Itinéraire']];
   function folderTabs(c, tab) {
     const n = f => (S.charter_documents || []).filter(d => d.charter_id === c.id && d.folder === f).length;
     return `<nav class="folder-tabs no-print">${FOLDERS.map(([k, l, sub]) => {
       const cnt = k === 'apa' ? S.expenses.filter(e => e.charter_id === c.id).length : k === 'day' ? 0 : n(k);
       return `<a href="#/charter/${c.id}${k === 'apa' ? '' : '/' + k}" class="folder-tab ${tab === k ? 'on' : ''}">${ICON.folder}
-        <span><b>${l}</b><small><span class="ft-sub">${sub}</span>${cnt ? `<span class="ft-sub"> · </span>${cnt} ${k === 'apa' ? 'dép.' : 'élém.'}` : ''}</small></span></a>`; }).join('')}</nav>`;
+        <span><b>${l}</b><small><span class="ft-sub">${sub}</span>${cnt ? `<span class="ft-sub"> · </span>${cnt} ${k === 'apa' ? 'dép.' : k === 'guests' ? 'pass.' : 'élém.'}` : ''}</small></span></a>`; }).join('')}</nav>`;
   }
   function viewCharter(id, tab = 'apa') {
     const c = charterById(id);

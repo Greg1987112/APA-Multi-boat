@@ -2612,11 +2612,16 @@
   // Liste ordonnée des escales où des passagers montent ou descendent, et passagers à bord après chacune
   function voyageOf(c) {
     const M = guestMeta(c), G = guestsOf(c), map = new Map();
-    const add = (pt, kind, x) => { const k = portKey(pt); let m = map.get(k); if (!m) map.set(k, m = { ...pt, key: k, emb: [], dis: [] }); if (x) m[kind].push(x); return k; };
+    // Une escale de débarquement identique à celle d'embarquement (même jour, même port : day charter, aller-retour,
+    // charter sans date de fin) reste une escale distincte, placée après.
+    const add = (pt, kind, x, avoid) => { let k = portKey(pt); if (kind === 'dis' && (k === avoid || k === startKey)) k += '|end';
+      let m = map.get(k); if (!m) map.set(k, m = { ...pt, key: k, emb: [], dis: [], end: k.endsWith('|end') }); if (x) m[kind].push(x); return k; };
+    const startKey = portKey({ date: c.start_date || '', port: M.port_emb });
     add({ date: c.start_date || '', port: M.port_emb, country: M.emb_country }, 'emb');
-    G.forEach(x => { const mv = guestMoves(c, x.g, M); x.embKey = add(mv.emb, 'emb', x); x.disKey = add(mv.dis, 'dis', x); });
+    G.forEach(x => { const mv = guestMoves(c, x.g, M); x.embKey = add(mv.emb, 'emb', x); x.disKey = add(mv.dis, 'dis', x, x.embKey); });
     add({ date: c.end_date || c.start_date || '', port: M.port_dis, country: M.dis_country }, 'dis');
-    const stops = [...map.values()].sort((a, b) => String(a.date).localeCompare(String(b.date)));
+    const stops = [...map.values()].sort((a, b) => String(a.date).localeCompare(String(b.date)) || (a.end ? 1 : 0) - (b.end ? 1 : 0)
+      || (b.emb.length ? 1 : 0) - (a.emb.length ? 1 : 0));
     const idx = new Map(stops.map((s, i) => [s.key, i]));
     G.forEach(x => { x.ei = idx.get(x.embKey); x.di = idx.get(x.disKey); });
     const onBoardAfter = i => G.filter(x => x.ei <= i && x.di > i);
@@ -2968,7 +2973,11 @@
       try { if (kind === 'pdf') await fal6Pdf(c, pt); else { await loadScript(XLSX_JS); fal6Xlsx(c, pt); } closeModal(); }
       catch (e) { toast(errMsg(e), 'err'); } finally { busy(btn, false); }
     };
-    if (!pts.length) return toast('Ajoutez d’abord des passagers', 'err');
+    if (!pts.length) { // secours : tous les passagers, au départ du charter
+      const G = guestsOf(c), M = guestMeta(c);
+      if (!G.length) return toast('Ajoutez d’abord des passagers', 'err');
+      pts.push({ direction: 'departure', port: M.port_emb, date: c.start_date, guests: G, label: `Departure — ${fdate(c.start_date)} ${M.port_emb || ''} (${G.length} pax)` });
+    }
     const m = openModal({ title: `Passenger List (FAL 6) — ${kind === 'pdf' ? 'PDF' : 'Excel'}`,
       body: `<p class="muted small">Choisissez le départ ou l’arrivée : la liste contient les passagers à bord à ce moment-là.</p>
         <div class="fal-points">${pts.map((p, i) => `<button class="btn ${p.direction === 'departure' ? 'btn-primary' : 'btn-ghost'} btn-block" data-pt="${i}">${esc(p.label)}</button>`).join('')}</div>` });

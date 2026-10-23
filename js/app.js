@@ -2696,7 +2696,7 @@
         <div class="mv-head"><b>${fdate(st.m.date)} · ${stopLabel(st.m)}</b>
           <span class="badge ${isDis ? 'badge-open' : 'badge-ok'}">${isDis ? 'Disembark' : 'Embark'} ${st.ids.length}</span></div>
         <div class="small">${names || '<span class="muted">aucun passager</span>'}</div>
-        <div class="mv-foot"><span class="muted small"><b>${st.aboard.length}</b> passager${st.aboard.length > 1 ? 's' : ''} à bord ensuite</span>
+        <div class="mv-foot"><span class="muted small"><b>${st.aboard.length}</b> passager${st.aboard.length > 1 ? 's' : ''} à bord ensuite${st.aboard.length ? ` · Guest List valable <b>du ${fdate(st.m.date)} au ${fdate(H.steps[i + 1]?.m.date || c.end_date)}</b>${H.steps[i + 1] ? '' : ' (fin du charter)'}` : ''}</span>
           <span class="row-gap wrap">
             ${saved?.file_path ? `<button class="btn btn-ghost btn-xs" data-act="guest-file" data-id="${saved.id}">${ICON.eye}Guest List</button>` : ''}
             <button class="btn btn-ghost btn-xs" data-act="move-list" data-id="${st.d.id}" data-kind="pdf" ${st.aboard.length ? '' : 'disabled'}>${ICON.file}PDF</button>
@@ -2812,7 +2812,9 @@
     const type = cur ? cur.m.type : (b.dataset.type || 'embark');
     const first = !moves.length;
     const lastMove = moves[moves.length - 1]?.m;
-    const date0 = cur ? cur.m.date : first ? (c.start_date || today()) : clampDate(today(), c);
+    // date proposée : début du charter pour le 1er embarquement, sinon aujourd'hui si on est pendant le charter, sinon la date du dernier mouvement
+    const inCharter = (!c.start_date || today() >= c.start_date) && (!c.end_date || today() <= c.end_date);
+    const date0 = cur ? cur.m.date : first ? (c.start_date || today()) : inCharter ? today() : (lastMove?.date || c.start_date || today());
     const port0 = cur ? cur.m.port : first ? M.port_emb : '';
     const country0 = cur ? cur.m.country : first ? M.emb_country : (lastMove?.country || M.emb_country || '');
     const m = openModal({ title: `${type === 'disembark' ? 'Disembark — passagers qui quittent le bord' : 'Embark — passagers qui montent à bord'}`, wide: true,
@@ -2820,7 +2822,7 @@
           <div class="seg fal-dir span-2" role="radiogroup" aria-label="Mouvement">
             <label><input type="radio" name="type" value="embark" ${type !== 'disembark' ? 'checked' : ''}> <span>Embark</span></label>
             <label><input type="radio" name="type" value="disembark" ${type === 'disembark' ? 'checked' : ''}> <span>Disembark</span></label></div>
-          <label class="field"><span>Date</span><input type="date" name="date" required value="${esc(date0 || '')}"></label>
+          <label class="field"><span>Date</span><input type="date" name="date" required value="${esc(date0 || '')}" min="${esc(c.start_date || '')}" max="${esc(c.end_date || '')}"></label>
           <label class="field"><span>Port ou mouillage</span><input name="port" required value="${esc(port0 || '')}" placeholder="ex. Cannes"></label>
           <label class="field"><span>Pays</span><input name="country" required list="dl-countries" value="${esc(country0 || '')}" placeholder="ex. France"></label>
           <div class="span-2"><div class="row-gap" style="justify-content:space-between"><b class="small" id="mv-q"></b>
@@ -2843,11 +2845,12 @@
     f.addEventListener('change', e => { if (e.target.name === 'type' || e.target.name === 'date') draw(); });
     $$('[data-all]', m).forEach(x => x.addEventListener('click', () => $$('input[name=g]', m).forEach(i => { i.checked = x.dataset.all === '1'; })));
     draw();
-    $$('[data-ok]', m).forEach(btn => btn.onclick = async ev => {
+    $$('[data-ok]', m).forEach(btn => btn.onclick = async () => {
       if (!f.reportValidity()) return;
+      const andEdit = btn.dataset.ok === '1'; // (après un « await », l'événement ne connaît plus le bouton : on le garde ici)
       const ids = $$('input[name=g]:checked', f).map(i => i.value);
       if (!ids.length) { toast('Cochez au moins un passager', 'err'); return; }
-      busy(ev.currentTarget, true);
+      busy(btn, true);
       const mv = { type: f.querySelector('input[name=type]:checked').value, date: f.date.value, port: f.port.value.trim(), country: f.country.value.trim(), guests: ids };
       const label = `${mv.type === 'disembark' ? 'Disembark' : 'Embark'} ${fdate(mv.date)} ${mv.port}`;
       try {
@@ -2855,9 +2858,9 @@
         if (cur) await api.update('charter_documents', id, { title: label, note: JSON.stringify(mv) });
         else id = (await api.insert('charter_documents', { charter_id: c.id, folder: 'guest_moves', title: label, note: JSON.stringify(mv) })).id;
         await reload();
-        if (ev.currentTarget.dataset.ok === '1') { closeModal(); await editMoveList(charterById(c.id), id, 'pdf'); }
+        if (andEdit) { closeModal(); await editMoveList(charterById(c.id), id, 'pdf'); }
         else { closeModal(); route(); toast('Mouvement enregistré'); }
-      } catch (e) { toast(errMsg(e), 'err'); busy(ev.currentTarget, false); }
+      } catch (e) { toast(errMsg(e), 'err'); busy(btn, false); }
     });
   };
   ACTIONS['move-del'] = async b => {
@@ -3083,8 +3086,8 @@
       <section class="panel">
         <div class="panel-head"><h2>Trajets</h2></div>
         <p class="muted small">Un charter compte pour <b>un seul trajet</b>, sauf si des passagers montent ou descendent définitivement en escale (boutons Embark / Disembark de la Guest List) : chaque escale crée alors un trajet. « Auto » met <b>oui</b> quand le départ ou l’arrivée est hors de France. Choisissez <b>Oui</b> pour un trajet entre deux ports français pendant lequel le bateau est sorti des eaux territoriales (au-delà de 12 milles des côtes) : gardez la trace AIS ou GPS comme preuve.</p>
-        ${n ? `<div class="table-wrap"><table class="table table-cards table-compact"><thead><tr><th>Date</th><th>Charter</th><th>Départ</th><th>Arrivée</th><th class="num">Pax</th><th>Sorti des eaux FR</th><th>Mention & justificatif</th><th></th></tr></thead><tbody>
-          ${trips.map(t => `<tr><td data-label="Date"><div>${fdate(t.from.date)}${t.to.date && t.to.date !== t.from.date ? ` → ${fdate(t.to.date)}` : ''}</div></td>
+        ${n ? `<div class="table-wrap"><table class="table table-cards table-compact"><thead><tr><th>Dates</th><th>Charter</th><th>Départ</th><th>Arrivée</th><th class="num">Pax</th><th>Sorti des eaux FR</th><th>Mention & justificatif</th><th></th></tr></thead><tbody>
+          ${trips.map(t => `<tr><td data-label="Dates"><div>${t.to.date && t.to.date !== t.from.date ? `Du ${fdate(t.from.date)}<br>au ${fdate(t.to.date)}` : fdate(t.from.date)}</div></td>
             <td data-label="Charter"><div>${t.c ? `<a href="#/charter/${t.c.id}/guests">${esc(t.c.title)}</a>` : `<i>Saisi à la main</i>${t.note ? `<br><small class="muted">${esc(t.note)}</small>` : ''}`}</div></td>
             <td data-label="Départ"><div>${stopLabel(t.from)}</div></td><td data-label="Arrivée"><div>${stopLabel(t.to)}</div></td>
             <td data-label="Pax" class="num"><div>${t.pax ?? '—'}</div></td><td data-label="Hors eaux FR"><div>${flagSel(t)}</div></td>

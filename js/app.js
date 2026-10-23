@@ -2716,6 +2716,20 @@
         <div class="mv-list">${V.stops.map(stopRow).join('')}</div>
         <p class="small"><span class="muted">Trajets douane pour ce charter :</span> <b>${trajets.length}</b>${trajets.length ? ' — ' + trajets.map(t => `${esc(t.from.port || '?')} → ${esc(t.to.port || '?')} ${trajetOut(t) ? '<span class="badge badge-ok">hors eaux FR</span>' : '<span class="badge badge-open">eaux FR</span>'}`).join(' · ') : ''}</p>
       </section>
+      ${(() => { const L = (S.charter_documents || []).filter(d => d.charter_id === c.id && d.folder === 'guest_lists')
+          .sort((a, b) => String(b.created_at || '').localeCompare(String(a.created_at || '')));
+        return `<section class="panel">
+        <div class="panel-head"><h2>Listes éditées${L.length ? ` (${L.length})` : ''}</h2>
+          <div class="row-gap wrap"><button class="btn btn-ghost btn-sm" data-act="fal6-xlsx" ${list.length ? '' : 'disabled'}>${ICON.sheet}Excel</button>
+          <button class="btn btn-primary btn-sm" data-act="fal6-pdf" ${list.length ? '' : 'disabled'}>${ICON.file}Éditer une FAL 6</button></div></div>
+        <p class="muted small">Chaque Passenger List éditée (PDF ou Excel) est gardée ici, avec la date d’édition et les passagers qu’elle contient.</p>
+        ${L.length ? `<div class="doc-list">${L.map(d => { const n = parseNote(d); return `<div class="doc-item"><div class="doc-ico">${n.kind === 'Excel' ? ICON.sheet : ICON.file}</div><div class="doc-main">
+            <b>${esc(d.title || d.file_name || 'Passenger List')}</b> <span class="badge ${n.direction === 'arrival' ? 'badge-open' : 'badge-ok'}">${esc(n.kind || 'PDF')} · ${n.pax ?? '?'} pax</span>
+            <small class="muted">éditée le ${fdatetime(d.created_at)}${n.names?.length ? ' · ' + esc(n.names.join(', ')) : ''}</small></div>
+            <div class="row-gap">${d.file_path ? `<button class="icon-btn" data-act="guest-file" data-id="${d.id}" title="Ouvrir / télécharger">${ICON.eye}</button>` : ''}
+            <button class="icon-btn danger" data-act="gl-del" data-id="${d.id}" title="Supprimer">${ICON.trash}</button></div></div>`; }).join('')}</div>`
+          : '<div class="empty-state"><p class="muted">Aucune liste éditée pour l’instant.</p></div>'}
+      </section>`; })()}
       <section class="panel">
         <div class="panel-head"><h2>Formulaire FAL 6</h2></div>
         <p class="muted small">Embarquement et débarquement prévus pour tous les passagers (aux dates du charter), sauf ceux que vous faites monter ou descendre en cours de route.</p>
@@ -2829,6 +2843,12 @@
     const d = (S.charter_documents || []).find(x => x.id === b.dataset.id); if (!d) return;
     if (!(await confirmDialog(`Supprimer <b>${esc(d.title || 'ce passager')}</b> et le scan de son passeport ?`, 'Supprimer'))) return;
     try { await api.remove('charter_documents', d.id); if (d.file_path) await api.removeFile(d.file_path).catch(() => {}); await reload(); route(); toast('Passager supprimé'); }
+    catch (e) { toast(errMsg(e), 'err'); }
+  };
+  ACTIONS['gl-del'] = async b => {
+    const d = (S.charter_documents || []).find(x => x.id === b.dataset.id); if (!d) return;
+    if (!(await confirmDialog(`Supprimer la liste « ${esc(d.title || '')} » ?`, 'Supprimer'))) return;
+    try { await api.remove('charter_documents', d.id); if (d.file_path) await api.removeFile(d.file_path).catch(() => {}); await reload(); route(); toast('Liste supprimée'); }
     catch (e) { toast(errMsg(e), 'err'); }
   };
   ACTIONS['guest-purge'] = async () => {
@@ -2950,7 +2970,7 @@
       doc.setFont('helvetica', 'bold'); doc.setFontSize(9);
       doc.text(pdfText([fdate(pt.date || today()), M.master].filter(Boolean).join('   —   ')), X0 + 2, y + 10);
     }
-    saveBlob(doc.output('blob'), `Passenger_List_FAL6_${pt.direction === 'arrival' ? 'Arrival' : 'Departure'}_${safeName(pt.port || '')}_${pt.date || ''}.pdf`);
+    return { blob: doc.output('blob'), name: `Passenger_List_FAL6_${pt.direction === 'arrival' ? 'Arrival' : 'Departure'}_${safeName(pt.port || '')}_${pt.date || ''}.pdf` };
   }
   function fal6Xlsx(c, pt) {
     const M = guestMeta(c), P = PROFILE;
@@ -2962,16 +2982,27 @@
     const X = window.XLSX, ws = X.utils.aoa_to_sheet(aoa);
     ws['!cols'] = [{ wch: 5 }, ...[18, 20, 16, 12, 16, 8, 14, 16, 16, 12, 16, 12, 16, 10].map(w => ({ wch: w }))];
     const wb = X.utils.book_new(); X.utils.book_append_sheet(wb, ws, 'FAL 6');
-    saveBlob(new Blob([X.write(wb, { type: 'array', bookType: 'xlsx' })], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' }),
-      `Passenger_List_FAL6_${pt.direction === 'arrival' ? 'Arrival' : 'Departure'}_${safeName(pt.port || '')}_${pt.date || ''}.xlsx`);
+    return { blob: new Blob([X.write(wb, { type: 'array', bookType: 'xlsx' })], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' }),
+      name: `Passenger_List_FAL6_${pt.direction === 'arrival' ? 'Arrival' : 'Departure'}_${safeName(pt.port || '')}_${pt.date || ''}.xlsx` };
+  }
+  // Chaque liste éditée est archivée dans la Guest List (stockage privé) pour la retrouver plus tard
+  async function archiveList(c, pt, out, kind) {
+    const up = await api.uploadPrivate(new File([out.blob], out.name, { type: out.blob.type }), `guest-lists/${c.id}`);
+    await api.insert('charter_documents', { charter_id: c.id, folder: 'guest_lists', title: pt.label.replace(/\s*\(\d+ pax\)$/, ''), ...up,
+      note: JSON.stringify({ direction: pt.direction, port: pt.port, date: pt.date, pax: pt.guests.length, kind, names: pt.guests.map(x => [x.g.family, x.g.given].filter(Boolean).join(' ')) }) });
   }
   // Choix du départ / de l'arrivée à éditer (direct s'il n'y en a qu'un)
   function pickFalPoint(c, kind) {
     const pts = falPoints(c);
     const run = async (pt, btn) => {
       busy(btn, true);
-      try { if (kind === 'pdf') await fal6Pdf(c, pt); else { await loadScript(XLSX_JS); fal6Xlsx(c, pt); } closeModal(); }
-      catch (e) { toast(errMsg(e), 'err'); } finally { busy(btn, false); }
+      let out;
+      try { out = kind === 'pdf' ? await fal6Pdf(c, pt) : (await loadScript(XLSX_JS), fal6Xlsx(c, pt)); }
+      catch (e) { toast(errMsg(e), 'err'); busy(btn, false); return; }
+      closeModal();
+      try { await archiveList(c, pt, out, kind === 'pdf' ? 'PDF' : 'Excel'); await reload(); route(); toast('Liste enregistrée dans la Guest List'); }
+      catch (e) { toast(`Liste téléchargée mais non archivée : ${errMsg(e)}`, 'err'); }
+      saveBlob(out.blob, out.name);
     };
     if (!pts.length) { // secours : tous les passagers, au départ du charter
       const G = guestsOf(c), M = guestMeta(c);

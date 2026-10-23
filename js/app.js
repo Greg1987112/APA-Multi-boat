@@ -2303,20 +2303,26 @@
         const idx = m.index;
         const dobRaw = asDigits(m[1]), dobChk = asDigits(m[2]), expRaw = asDigits(m[4]), expChk = asDigits(m[5]);
         const dobOk = mrzCheck(dobRaw) === dobChk, expOk = mrzCheck(expRaw) === expChk;
-        let doc, docChk, nat, l1, names, type, issuing;
+        let doc, docChk, nat, l1, names, type, issuing, rawNames;
         if (idx >= 13) {           // passeport (TD3) ou ancien format 2 lignes (TD2)
-          doc = L.slice(idx - 13, idx - 4); docChk = asDigits(L[idx - 4] || ''); nat = L.slice(idx - 3, idx);
-          l1 = lines[i - 1] || ''; names = mrzNames(l1.slice(5)); type = l1[0]; issuing = l1.slice(2, 5);
+          nat = L.slice(idx - 3, idx);
+          // n° du document : position normale, ou décalée d'un caractère si la lecture en a ajouté ou perdu un
+          for (const off of [0, -1, 1, -2]) {
+            const st = idx - 13 + off; if (st < 0) continue;
+            const dd = L.slice(st, st + 9), cc = asDigits(L[st + 9] || '');
+            if (doc === undefined || fixWithCheck(dd, cc).ok) { doc = dd; docChk = cc; if (fixWithCheck(dd, cc).ok) break; }
+          }
+          l1 = lines[i - 1] || ''; rawNames = l1.slice(5); names = mrzNames(rawNames); type = l1[0]; issuing = l1.slice(2, 5);
         } else if (idx <= 1) {     // carte d'identité (TD1, 3 lignes)
           l1 = lines[i - 1] || ''; nat = L.slice(idx + 15, idx + 18);
           doc = l1.slice(5, 14); docChk = asDigits(l1[14] || ''); type = l1[0]; issuing = l1.slice(2, 5);
-          names = mrzNames(lines[i + 1] || '');
+          rawNames = lines[i + 1] || ''; names = mrzNames(rawNames);
         } else continue;
         const docFix = fixWithCheck(doc, docChk);
         const score = (dobOk ? 1 : 0) + (expOk ? 1 : 0) + (docFix.ok ? 1 : 0) + (names.family ? 0.5 : 0);
         if (best && best.score >= score) continue;
         const dt = type === 'P' ? 'Passport' : /[IAC]/.test(type || '') ? 'Identity card' : (idx >= 13 ? 'Passport' : 'Identity card');
-        best = { score, ok: dobOk && expOk && docFix.ok,
+        best = { score, ok: dobOk && expOk && docFix.ok, rawNames,
           fields: { family: names.family, given: names.given, nationality: countryName(asAlpha(nat)), dob: mrzDate(dobRaw, 'dob'),
             gender: m[3] === '<' ? '' : m[3], doc_type: dt, doc_no: docFix.v.replace(/</g, ''), issuing: countryName(asAlpha(issuing || '')),
             expiry: mrzDate(expRaw, 'exp') } };
@@ -2341,6 +2347,121 @@
     for (let j = 0; j < p.length; j += 4) { const g = Math.max(0, Math.min(255, ((p[j] - lo) * 255 / span) | 0)); p[j] = p[j + 1] = p[j + 2] = g; }
     cx.putImageData(im, 0, 0); return cv;
   }
+  // Repère la bande MRZ sur la photo : redresse l'image (±6°) puis cherche, tout en bas, 2 ou 3 lignes de texte
+  // denses qui couvrent presque toute la largeur. Retourne un recadrage net de la bande, prêt pour la lecture.
+  function rotCanvas(src, deg, scale = 1) {
+    const rad = deg * Math.PI / 180, sw = src.width * scale, sh = src.height * scale, co = Math.abs(Math.cos(rad)), si = Math.abs(Math.sin(rad));
+    const cv = document.createElement('canvas'); cv.width = Math.round(sw * co + sh * si); cv.height = Math.round(sw * si + sh * co);
+    const x = cv.getContext('2d', { willReadFrequently: true }); x.fillStyle = '#fff'; x.fillRect(0, 0, cv.width, cv.height);
+    x.translate(cv.width / 2, cv.height / 2); x.rotate(rad); x.imageSmoothingQuality = 'high'; x.drawImage(src, -sw / 2, -sh / 2, sw, sh); return cv;
+  }
+  function grayOf(cv) {
+    const d = cv.getContext('2d').getImageData(0, 0, cv.width, cv.height).data, g = new Uint8Array(cv.width * cv.height);
+    for (let i = 0, j = 0; i < d.length; i += 4, j++) g[j] = (d[i] * 0.3 + d[i + 1] * 0.59 + d[i + 2] * 0.11) | 0;
+    return g;
+  }
+  function enhance(cv) {
+    const cx = cv.getContext('2d'), im = cx.getImageData(0, 0, cv.width, cv.height), p = im.data, hist = new Uint32Array(256);
+    for (let j = 0; j < p.length; j += 4) { const g = (p[j] * 0.3 + p[j + 1] * 0.59 + p[j + 2] * 0.11) | 0; p[j] = g; hist[g]++; }
+    const n = p.length / 4; let lo = 0, hi = 255, acc = 0;
+    for (let v = 0; v < 256; v++) { acc += hist[v]; if (acc > n * 0.02) { lo = v; break; } }
+    acc = 0; for (let v = 255; v >= 0; v--) { acc += hist[v]; if (acc > n * 0.02) { hi = v; break; } }
+    const span = Math.max(1, hi - lo);
+    for (let j = 0; j < p.length; j += 4) { const g = Math.max(0, Math.min(255, ((p[j] - lo) * 255 / span) | 0)); p[j] = p[j + 1] = p[j + 2] = g; }
+    cx.putImageData(im, 0, 0); return cv;
+  }
+  // Seuillage local (ombres, reflets, fonds dégradés) : chaque pixel est comparé à la moyenne de son voisinage
+  function binarize(cv, win) {
+    const W = cv.width, H = cv.height, g = grayOf(cv), I = new Float64Array((W + 1) * (H + 1));
+    for (let y = 0; y < H; y++) { let rs = 0; for (let x = 0; x < W; x++) { rs += g[y * W + x]; I[(y + 1) * (W + 1) + x + 1] = I[y * (W + 1) + x + 1] + rs; } }
+    const r = Math.max(8, win | 0), out = document.createElement('canvas'); out.width = W; out.height = H;
+    const cx = out.getContext('2d'), im = cx.createImageData(W, H), p = im.data;
+    for (let y = 0; y < H; y++) {
+      const y0 = Math.max(0, y - r), y1 = Math.min(H, y + r + 1);
+      for (let x = 0; x < W; x++) {
+        const x0 = Math.max(0, x - r), x1 = Math.min(W, x + r + 1);
+        const m = (I[y1 * (W + 1) + x1] - I[y0 * (W + 1) + x1] - I[y1 * (W + 1) + x0] + I[y0 * (W + 1) + x0]) / ((x1 - x0) * (y1 - y0));
+        const v = g[y * W + x] < m * 0.82 ? 0 : 255, o = (y * W + x) * 4; p[o] = p[o + 1] = p[o + 2] = v; p[o + 3] = 255;
+      }
+    }
+    cx.putImageData(im, 0, 0); return out;
+  }
+  function rowProfile(cv) {
+    const W = cv.width, H = cv.height, g = grayOf(cv), BINS = 24, bw = W / BINS, cnt = new Float32Array(H), bins = new Uint8Array(H), xs = [];
+    for (let y = 0; y < H; y++) {
+      const seen = new Uint8Array(BINS), o = y * W; let c = 0, x0 = W, x1 = 0;
+      for (let x = 2; x < W; x++) if (Math.abs(g[o + x] - g[o + x - 2]) > 45) { c++; seen[Math.min(BINS - 1, (x / bw) | 0)] = 1; if (x < x0) x0 = x; x1 = x; }
+      cnt[y] = c; bins[y] = seen.reduce((a, b) => a + b, 0); xs.push([x0, x1]);
+    }
+    return { cnt, bins, xs, BINS };
+  }
+  function mrzBand(src, rot) {
+    const up = rot ? rotCanvas(src, rot) : src, k = Math.min(1, 640 / up.width);
+    let best = null;
+    const tryA = a => { const sm = rotCanvas(up, a, k), pr = rowProfile(sm); let sc = 0; for (const v of pr.cnt) sc += v * v; if (!best || sc > best.sc) best = { a, sc, sm, pr }; };
+    for (let a = -6; a <= 6; a += 1.5) tryA(a);
+    const a0 = best.a; tryA(a0 - 0.75); tryA(a0 + 0.75);
+    const { a, sm, pr } = best, H = sm.height, mx = Math.max(...pr.cnt);
+    const ok = y => pr.bins[y] >= pr.BINS * 0.4 && pr.cnt[y] >= mx * 0.3 && pr.xs[y][1] - pr.xs[y][0] >= sm.width * 0.45;
+    const quiet = (y0, y1) => { let t = 0, n = 0; for (let y = Math.max(0, y0); y <= Math.min(H - 1, y1); y++) { t += pr.cnt[y]; n++; } return !n || t / n < mx * 0.15; };
+    const lines = []; let cur = null;
+    for (let y = 0; y < H; y++) {
+      if (ok(y)) { if (cur && y - cur.y1 <= 2) cur.y1 = y; else { cur = { y0: y, y1: y }; lines.push(cur); } }
+    }
+    const L = lines.filter(l => l.y1 - l.y0 >= 2);
+    for (let i = L.length - 2; i >= 0; i--) {
+      const l1 = L[i], l2 = L[i + 1], h1 = l1.y1 - l1.y0 + 1, h2 = l2.y1 - l2.y0 + 1, gap = l2.y0 - l1.y1;
+      if (Math.max(h1, h2) / Math.min(h1, h2) > 2.2 || gap > 2.8 * Math.max(h1, h2) || gap < 1) continue;
+      if (!quiet(l1.y1 + 2, l2.y0 - 2) || !quiet(l2.y1 + 2, l2.y1 + Math.max(h1, h2))) continue; // interligne et dessous propres
+      let top = l1, n = 2; const l0 = L[i - 1];
+      if (l0) { const h0 = l0.y1 - l0.y0 + 1; if (Math.max(h0, h1) / Math.min(h0, h1) < 2.2 && l1.y0 - l0.y1 <= 2.8 * Math.max(h0, h1) && Math.abs((l1.y0 - l0.y1) - gap) <= Math.max(3, gap * 0.6)) { top = l0; n = 3; } }
+      const h = Math.max(h1, h2);
+      let x0 = sm.width, x1 = 0;
+      for (let y = top.y0; y <= l2.y1; y++) { if (pr.xs[y][0] < x0) x0 = pr.xs[y][0]; if (pr.xs[y][1] > x1) x1 = pr.xs[y][1]; }
+      const y0 = Math.max(0, top.y0 - h), y1 = Math.min(H, l2.y1 + h), pad = h * 1.5;
+      const full = rotCanvas(up, a), s = full.width / sm.width;
+      const cx0 = Math.max(0, (x0 - pad) * s), cx1 = Math.min(full.width, (x1 + pad) * s), cy0 = y0 * s, cy1 = y1 * s;
+      const z = Math.min(3, 1800 / (cx1 - cx0));
+      const cv = document.createElement('canvas'); cv.width = Math.round((cx1 - cx0) * z); cv.height = Math.round((cy1 - cy0) * z);
+      const cx = cv.getContext('2d', { willReadFrequently: true }); cx.imageSmoothingQuality = 'high'; cx.drawImage(full, cx0, cy0, cx1 - cx0, cy1 - cy0, 0, 0, cv.width, cv.height);
+      return { cv: enhance(cv), bin: binarize(cv, (cv.height / (n * 2.2))), upright: full, lines: n };
+    }
+    return null;
+  }
+  // Lieu de naissance : absent de la bande MRZ, lu dans la zone visuelle sous l'intitulé (EN, FR, IT, ES, DE, PT, NL)
+  const POB_LABEL = /(place|lieu|luogo|lugar|local)\s*(of|de|di|do)?\s*(birth|naissance|nascita|nacimiento|nascimento)|geburtsort|geboorteplaats/i;
+  const OTHER_LABEL = /date|sex|sexe|sesso|authority|autorit|issue|d[ée]livr|expir|nationalit|signature|height|taille/i;
+  function parsePob(text) {
+    const lines = String(text || '').split('\n').map(l => l.trim()).filter(Boolean);
+    for (let i = 0; i < lines.length; i++) {
+      const m = lines[i].match(POB_LABEL); if (!m) continue;
+      const rest = lines[i].slice(m.index + m[0].length).replace(/^[\s:\/.-]+/, '');
+      for (const cand of [rest, ...lines.slice(i + 1, i + 3)]) {
+        if (!cand || cand.includes('<') || POB_LABEL.test(cand) || /naissance|nacimiento|nascita|birth/i.test(cand)) continue;
+        if (OTHER_LABEL.test(cand) && !/[A-Z]{4,}/.test(cand.replace(OTHER_LABEL, ''))) continue;
+        let v = cand.replace(/[^A-Za-zÀ-ÖØ-öø-ÿ ,.'\/-]/g, ' ').replace(/\s+/g, ' ').trim();
+        v = v.replace(/(\s+[A-Za-z]{1,2})+$/, '').replace(/^[^A-Za-zÀ-ÿ]+|[\s,\/-]+$/g, '').trim();
+        if (v.replace(/[^A-Za-zÀ-ÿ]/g, '').length >= 3) return v.toUpperCase().slice(0, 50);
+      }
+    }
+    return '';
+  }
+  // Les « < » de la ligne des noms sont parfois lus K ou C : on recoupe avec les noms imprimés sur la page
+  function fixNames(r, text) {
+    const T = ' ' + String(text || '').toUpperCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/[^A-Z]+/g, ' ') + ' ';
+    const has = w => w && w.length >= 2 && T.includes(' ' + w + ' ');
+    const f = r.fields, firstGiven = (f.given || '').split(' ')[0];
+    if (has(f.family.split(' ')[0]) && (!firstGiven || has(firstGiven))) return;
+    const s = asAlpha(String(r.rawNames || '')), clean = x => x.replace(/</g, ' ').replace(/\s+/g, ' ').trim();
+    for (let i = 1; i < s.length - 2; i++) {
+      if (!/[<KCLS]/.test(s[i]) || !/[<KCLS]/.test(s[i + 1])) continue;
+      const sur = clean(s.slice(0, i)), giv = clean(cutFiller(s.slice(i + 2)));
+      if (has(sur.split(' ')[0]) && has(giv.split(' ')[0])) {
+        // les « < » lus K/C à l'intérieur des prénoms : on garde les mots présents sur la page
+        f.family = sur; f.given = giv.split(' ').map(w => has(w) ? w : w.replace(/[KC]$/, '')).filter(Boolean).join(' '); return;
+      }
+    }
+  }
   async function readPassport(file, onStep) {
     const name = file.name.toLowerCase();
     let sources;
@@ -2348,17 +2469,38 @@
     else { const bmp = await createImageBitmap(file); sources = [bmp]; }
     await loadScript(TESS_JS);
     const worker = await window.Tesseract.createWorker('eng', 1, { ...TESS_OPTS });
-    await worker.setParameters({ tessedit_char_whitelist: 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789<', tessedit_pageseg_mode: '6' });
-    let best = null, step = 0;
+    const MRZ_PARAMS = { tessedit_char_whitelist: 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789<', tessedit_pageseg_mode: '6' };
+    await worker.setParameters(MRZ_PARAMS);
+    let best = null, step = 0, upright = null;
+    const tryCanvas = async (cv, up) => {
+      onStep && onStep(++step);
+      const r = parseMRZ((await worker.recognize(cv)).data.text);
+      if (r && (!best || r.score > best.score)) { best = r; upright = up; }
+      return best && best.ok;
+    };
     try {
-      for (const src of sources) {
-        const passes = [[0, 0.55], [0, 0], [180, 0.55], [90, 0.55], [270, 0.55]];
-        for (const [rot, top] of passes) {
-          onStep && onStep(++step);
-          const r = parseMRZ((await worker.recognize(mrzCanvas(src, rot, top))).data.text);
-          if (r && (!best || r.score > best.score)) best = r;
-          if (best && best.ok) return best;
+      search: for (const src of sources) {
+        for (const rot of [0, 180, 90, 270]) {               // 1) bande MRZ repérée et redressée
+          const band = mrzBand(src, rot);
+          if (band && (await tryCanvas(band.bin, band.upright) || await tryCanvas(band.cv, band.upright))) break search;
         }
+        for (const [rot, top] of [[0, 0.55], [0, 0]]) {       // 2) secours : bas de l'image, puis image entière
+          if (await tryCanvas(mrzCanvas(src, rot, top), null)) break search;
+        }
+      }
+      // 3) lieu de naissance dans la zone visuelle (lecture libre de la page redressée)
+      if (best && best.score >= 2) {
+        try {
+          onStep && onStep(++step);
+          await worker.setParameters({ tessedit_char_whitelist: '', tessedit_pageseg_mode: '3' });
+          const page = upright || sources[0], z = Math.min(1, 1800 / page.width);
+          const cv = document.createElement('canvas'); cv.width = Math.round(page.width * z); cv.height = Math.round(page.height * z);
+          cv.getContext('2d').drawImage(page, 0, 0, cv.width, cv.height);
+          const full = (await worker.recognize(enhance(cv))).data.text;
+          const pob = parsePob(full);
+          if (pob) { best.fields.pob = pob; best.pobAuto = true; }
+          fixNames(best, full);
+        } catch (e) { console.warn(e); }
       }
     } finally { await worker.terminate(); }
     return best && best.score >= 1 ? best : null;
@@ -2410,6 +2552,7 @@
     const missingTable = (S._missing || []).includes('charter_documents');
     const toCheck = list.filter(({ g }) => !g.checked && !g.mrz_ok).length;
     const incomplete = list.filter(({ g }) => guestMissing(g).length).length;
+    const pobCheck = list.filter(({ g }) => g.pob_auto && !g.checked).length;
     const shipInfo = [['Nom', BOAT?.name || YACHT], ['IMO', P.imo], ['Call sign', P.call_sign], ['Pavillon', P.flag_state]];
     const shipMissing = shipInfo.filter(([, v]) => !v).map(([l]) => l);
     const row = (x, i) => {
@@ -2422,7 +2565,7 @@
         <td data-label="N°"><div>${i + 1}</div></td>
         <td data-label="Nom"><div><b>${esc(g.family || '—')}</b> ${esc(g.given || '')}</div></td>
         <td data-label="Nationalité"><div>${esc(g.nationality || '')}</div></td>
-        <td data-label="Naissance"><div>${fdate(g.dob)}${g.pob ? `<br><small class="muted">${esc(g.pob)}</small>` : ''}</div></td>
+        <td data-label="Naissance"><div>${fdate(g.dob)}${g.pob ? `<br><small class="muted">${esc(g.pob)}</small>` : ''}${g.pob_auto && !g.checked ? '<br><span class="chip chip-warn" title="Lieu de naissance lu automatiquement sur la page : vérifiez-le">lieu à vérifier</span>' : ''}</div></td>
         <td data-label="Document"><div>${esc(g.doc_no || '')}<br><small class="muted">${esc(g.doc_type || '')}${g.issuing ? ' · ' + esc(g.issuing) : ''}</small></div></td>
         <td data-label="Expiration" class="${ex === 'bad' ? 'neg' : ex === 'warn' ? 'warn' : ''}"><div>${fdate(g.expiry)}${ex === 'bad' ? '<br><small>expiré pendant le charter</small>' : ex === 'warn' ? '<br><small>moins de 6 mois</small>' : ''}</div></td>
         <td data-label="À bord"><div>${fdate(mv.emb.date).slice(0, 5)} ${esc(mv.emb.port || '')}<br><small class="muted">→ ${fdate(mv.dis.date).slice(0, 5)} ${esc(mv.dis.port || '')}</small></div></td>
@@ -2460,7 +2603,7 @@
             <label class="btn btn-primary btn-sm file-btn">${ICON.plus}Ajouter des passeports<input type="file" multiple class="sr-file" id="guest-upload" accept="image/*,application/pdf,.heic"></label></div></div>
         <p class="muted small">Photo ou PDF de la page d’identité, un fichier par passager. La bande du bas (MRZ) est lue automatiquement dans le téléphone : nom, nationalité, date de naissance, sexe, n° et expiration. Le <b>lieu de naissance</b> n’y figure pas : complétez-le. Les scans sont rangés dans un espace privé (capitaine et équipage) et n’apparaissent jamais dans la vue client.</p>
         <div id="guest-progress" class="banner banner-info" hidden></div>
-        ${toCheck || incomplete ? `<div class="banner banner-gold">${ICON.eye}<div>${toCheck ? `<b>${toCheck} passager${toCheck > 1 ? 's' : ''} à vérifier</b> : lecture incertaine, comparez la fiche avec le passeport. ` : ''}${incomplete ? `<b>${incomplete} fiche${incomplete > 1 ? 's' : ''} à compléter</b> (le lieu de naissance n’est pas dans la bande MRZ).` : ''}</div></div>` : ''}
+        ${toCheck || incomplete || pobCheck ? `<div class="banner banner-gold">${ICON.eye}<div>${toCheck ? `<b>${toCheck} passager${toCheck > 1 ? 's' : ''} à vérifier</b> : lecture incertaine, comparez la fiche avec le passeport. ` : ''}${incomplete ? `<b>${incomplete} fiche${incomplete > 1 ? 's' : ''} à compléter</b> (le lieu de naissance n’est pas dans la bande MRZ). ` : ''}${pobCheck ? `<b>${pobCheck} lieu${pobCheck > 1 ? 'x' : ''} de naissance lu${pobCheck > 1 ? 's' : ''} automatiquement</b> : vérifiez-le${pobCheck > 1 ? 's' : ''} sur la fiche, puis cochez « J’ai vérifié ».` : ''}</div></div>` : ''}
         ${list.length ? `<div class="table-wrap"><table class="table table-cards table-compact"><thead><tr><th>N°</th><th>Nom</th><th>Nationalité</th><th>Naissance</th><th>Document</th><th>Expiration</th><th>À bord</th><th>État</th><th></th></tr></thead>
           <tbody>${list.map(row).join('')}</tbody></table></div>`
           : `<div class="empty-state"><p class="muted">Aucun passager. Ajoutez les photos des passeports : la liste se remplit toute seule.</p></div>`}
@@ -2524,7 +2667,7 @@
       try {
         say('enregistrement…');
         const up = await api.uploadPrivate(file, `passports/${c.id}`);
-        const g = { ...(r ? r.fields : {}), mrz_ok: !!r?.ok, order: order++, ...(emb || {}) };
+        const g = { ...(r ? r.fields : {}), mrz_ok: !!r?.ok, pob_auto: !!(r?.pobAuto && r.fields.pob), order: order++, ...(emb || {}) };
         await api.insert('charter_documents', { charter_id: c.id, folder: 'guests', title: [g.family, g.given].filter(Boolean).join(' ') || file.name, note: JSON.stringify(g), ...up });
         if (g.doc_no) known.add(g.doc_no);
         ok++; if (!r?.ok) unsure++;
@@ -2613,7 +2756,7 @@
           <label class="field"><span>7. Nationalité</span><input name="nationality" list="dl-countries" value="${esc(g.nationality || '')}"></label>
           <label class="field"><span>10. Sexe</span><select name="gender">${opt('', g.gender || '', '—')}${Object.entries(GENDERS).map(([k, l]) => opt(k, g.gender || '', l)).join('')}</select></label>
           <label class="field"><span>8. Date de naissance</span><input type="date" name="dob" value="${esc(g.dob || '')}"></label>
-          <label class="field"><span>9. Lieu de naissance</span><input name="pob" value="${esc(g.pob || '')}" placeholder="ex. Paris"></label>
+          <label class="field"><span>9. Lieu de naissance${g.pob_auto && !g.checked ? ' <small class="warn">lu automatiquement : à vérifier</small>' : ''}</span><input name="pob" value="${esc(g.pob || '')}" placeholder="ex. Paris"></label>
           <label class="field"><span>11. Type de document</span><select name="doc_type">${DOC_TYPES.map(t => opt(t, g.doc_type || 'Passport')).join('')}</select></label>
           <label class="field"><span>12. N° du document</span><input name="doc_no" value="${esc(g.doc_no || '')}" autocapitalize="characters"></label>
           <label class="field"><span>13. État émetteur</span><input name="issuing" list="dl-countries" value="${esc(g.issuing || '')}"></label>
@@ -2640,7 +2783,7 @@
       const { port_emb, port_dis, ...rest } = g; // eslint-disable-line no-unused-vars
       const ng = { ...rest, family: v('family').toUpperCase(), given: v('given'), nationality: v('nationality'), gender: v('gender'), dob: v('dob'),
         pob: v('pob'), doc_type: v('doc_type'), doc_no: v('doc_no').toUpperCase().replace(/\s+/g, ''), issuing: v('issuing'), expiry: v('expiry'),
-        visa: v('visa'), transit: !!fd.get('transit'), checked: !!fd.get('checked'),
+        visa: v('visa'), transit: !!fd.get('transit'), checked: !!fd.get('checked'), pob_auto: !!g.pob_auto && !fd.get('checked') && v('pob') === (g.pob || ''),
         emb_date: v('emb_date'), emb_port: v('emb_port'), emb_country: v('emb_country'), dis_date: v('dis_date'), dis_port: v('dis_port'), dis_country: v('dis_country') };
       if (ng.emb_date && ng.dis_date && ng.dis_date < ng.emb_date) { toast('Le débarquement doit être après l’embarquement', 'err'); busy(ev.currentTarget, false); return; }
       if (!d) ng.order = Math.max(0, ...guestsOf(c).map(x => x.g.order ?? 0)) + 1;

@@ -596,6 +596,7 @@
   const errMsg = e => {
     const m = (e && (e.message || e.error_description || e.details)) || String(e);
     if (/row-level security|permission denied|Non autorisé/i.test(m)) return 'Action non autorisée pour votre rôle sur ce bateau.';
+    if (/at_berth/.test(m)) return `Base de données à mettre à jour : exécutez le fichier « maj-guest-list.sql » dans Supabase (SQL Editor). (${m})`;
     if (/bucket not found|private-docs/i.test(m)) return `Base de données à mettre à jour : exécutez le fichier « maj-guest-list.sql » dans Supabase (SQL Editor). (${m})`;
     if (/boat_track/.test(m)) return `Base de données à mettre à jour : exécutez le fichier « maj-position.sql » dans Supabase (SQL Editor). (${m})`;
     const col = /(broker_fee_pct|auto_kind|auto_ref|'fee')/.exec(m);
@@ -2137,6 +2138,8 @@
         <label class="field"><span>Yacht</span><input name="yacht" value="${esc(c.yacht || YACHT)}"></label>
         <label class="field"><span>Début</span><input type="date" name="start_date" value="${esc(c.start_date || '')}"></label>
         <label class="field"><span>Fin</span><input type="date" name="end_date" value="${esc(c.end_date || '')}"></label>
+        <label class="check span-2 boat-toggle"><input type="checkbox" name="at_berth" ${c.at_berth ? 'checked' : ''}>
+          <span><b>Charter à quai</b> — le bateau ne navigue pas pendant ce contrat. Il ne crée aucun trajet, mais compte dans la règle des locations à quai (moins de 50 % des contrats de l’année) de l’onglet VAT Exo FR.</span></label>
         <label class="field"><span>APA reçu</span><input type="number" step="0.01" name="apa_paid" value="${esc(c.apa_paid ?? '')}"></label>
         <label class="field"><span>Bank fee sur l’APA (%) <small>(ligne de dépense auto, 0 = aucune)</small></span><input type="number" step="0.01" min="0" name="broker_fee_pct" value="${esc(c.broker_fee_pct ?? 0.4)}"></label>
         <label class="field field-fee"><span>Charter fee <small>(sert uniquement au calcul des tips)</small></span><input type="number" step="0.01" name="charter_fee" value="${esc(c.charter_fee ?? '')}" placeholder="ex. 155000"></label>
@@ -2188,7 +2191,8 @@
         fuel_company: d.fuel_company || null, fuel_description: d.fuel_description || null, fuel_method: d.fuel_method, notes: d.notes || null, fuel_by_boat: !!d.fuel_by_boat,
         ...(S.voyages.some(v => v.charter_id === c.id) ? {} : { auto_voyage: !!d.auto_voyage }),
         client_address: d.client_address || null, client_vat: d.client_vat || null,
-        report_to: cleanEmails(d.report_to) || null, report_cc: cleanEmails(d.report_cc) || null };
+        report_to: cleanEmails(d.report_to) || null, report_cc: cleanEmails(d.report_cc) || null,
+        ...(d.at_berth || c.at_berth ? { at_berth: !!d.at_berth } : {}) };
       const bad = [...splitEmails(d.report_to), ...splitEmails(d.report_cc)].filter(x => !EMAIL_RE.test(x));
       if (bad.length) return toast('E-mail invalide : ' + bad.join(', '), 'err');
       busy(ev.currentTarget, true);
@@ -2633,6 +2637,7 @@
   }
   // Trajets au sens des douanes : un contrat = un trajet, sauf si des passagers montent ou descendent définitivement en escale
   function trajetsOf(c) {
+    if (c.at_berth) return []; // charter à quai : pas de navigation, donc pas de trajet
     const M = guestMeta(c), H = boardHistory(c);
     const endStop = { date: c.end_date || c.start_date || '', port: M.port_dis, country: M.dis_country };
     if (!H.steps.length) {
@@ -3046,6 +3051,8 @@
     const year = yearArg && /^\d{4}$/.test(yearArg) ? yearArg : String(new Date().getFullYear());
     const trips = vatTrips(year), n = trips.length, out = trips.filter(tripOutOf).length;
     const pct = n ? Math.round(out / n * 1000) / 10 : 0, ok = n > 0 && pct >= 70;
+    const yearCharters = S.charters.filter(c => String(c.start_date || '').slice(0, 4) === year), berth = yearCharters.filter(c => c.at_berth);
+    const berthPct = yearCharters.length ? Math.round(berth.length / yearCharters.length * 1000) / 10 : 0, berthOk = berthPct < 50;
     const need = n ? Math.max(0, Math.ceil((0.7 * n - out) / 0.3)) : 0; // trajets hors eaux FR à ajouter pour atteindre 70 %
     const cap = isCaptain();
     const flagSel = t => {
@@ -3075,12 +3082,18 @@
           <button class="btn btn-ghost" data-act="vat-xlsx">${ICON.sheet}Excel</button>
           ${edit ? `<button class="btn btn-ghost" data-act="vat-zip">${ICON.folder}Dossier complet (.zip)</button>` : ''}
           <button class="btn btn-primary" data-act="vat-add">${ICON.plus}Ajouter un trajet</button></div></div>
-      <div class="kpis kpis-3">
-        <div class="kpi"><div class="kpi-label">Trajets</div><div class="kpi-value">${n}</div><div class="kpi-sub">${S.charters.filter(c => String(c.start_date || '').slice(0, 4) === year).length} charter(s)</div></div>
+      <div class="kpis">
+        <div class="kpi"><div class="kpi-label">Trajets</div><div class="kpi-value">${n}</div><div class="kpi-sub">${yearCharters.length - berth.length} charter(s) en mer${(PROFILE.vat_manual || []).some(t => String(t.date || '').slice(0, 4) === year) ? ' + trajets saisis' : ''}</div></div>
         <div class="kpi"><div class="kpi-label">Hors eaux territoriales FR</div><div class="kpi-value">${out}</div><div class="kpi-sub">${n - out} dans les eaux françaises</div></div>
         <div class="kpi ${n ? (ok ? 'kpi-balance is-pos' : 'kpi-balance is-neg') : ''}"><div class="kpi-label">Taux</div><div class="kpi-value">${n ? fmt(pct, pct % 1 ? 1 : 0) + ' %' : '—'}</div>
           <div class="kpi-sub">${!n ? 'aucun trajet' : ok ? 'seuil de 70 % atteint' : `il manque ${need} trajet${need > 1 ? 's' : ''} hors eaux FR`}</div></div>
+        <div class="kpi ${yearCharters.length ? (berthOk ? 'kpi-balance is-pos' : 'kpi-balance is-neg') : ''}"><div class="kpi-label">Charters à quai</div><div class="kpi-value">${berth.length} / ${yearCharters.length}</div>
+          <div class="kpi-sub">${yearCharters.length ? `${fmt(berthPct, berthPct % 1 ? 1 : 0)} % des contrats — ${berthOk ? 'sous le seuil de 50 %' : 'doit rester sous 50 %'}` : 'aucun contrat'}</div></div>
       </div>
+      ${n || yearCharters.length ? `<div class="banner ${ok && berthOk ? 'banner-ok' : 'banner-gold'}">${ICON.anchor}<div>${ok && berthOk
+        ? `<b>Conditions remplies pour ${year}</b> : ${fmt(pct, pct % 1 ? 1 : 0)} % des trajets hors eaux françaises et ${fmt(berthPct, berthPct % 1 ? 1 : 0)} % de charters à quai. L’exonération peut s’appliquer en ${+year + 1}.`
+        : `<b>Conditions non remplies pour l’instant</b> : ${!ok ? `taux de trajets hors eaux FR inférieur à 70 %` : ''}${!ok && !berthOk ? ' et ' : ''}${!berthOk ? 'charters à quai à 50 % des contrats ou plus' : ''}.`}
+        ${berth.length ? `<br><small class="muted">À quai : ${berth.map(c => esc(c.title)).join(', ')}</small>` : ''}</div></div>` : ''}
       <div class="vat-meter" role="img" aria-label="${fmt(pct, 1)} % des trajets hors eaux françaises"><div class="vat-fill ${ok ? 'ok' : ''}" style="width:${Math.min(100, pct)}%"></div><div class="vat-mark" style="left:70%"><span>70 %</span></div></div>
       ${missingProofs ? `<div class="banner banner-gold">${ICON.eye}<div><b>${missingProofs} trajet${missingProofs > 1 ? 's' : ''} entre ports français</b> déclaré${missingProofs > 1 ? 's' : ''} hors eaux territoriales sans justificatif : joignez une photo du relevé AIS ou de la carte ECDIS montrant le passage au-delà des 12 milles.</div></div>` : ''}
       <section class="panel">
@@ -3102,7 +3115,8 @@
           <li>Un <b>trajet</b> est une navigation commerciale entre deux ports ou mouillages, avec embarquement ou débarquement de passagers. Les convoyages, essais en mer ou passages au chantier ne comptent pas.</li>
           <li>Un trajet compte comme hors eaux FR dès que le bateau <b>sort des eaux territoriales françaises</b> (12 milles) : France → Italie, Italie → Grèce ou Cannes → Saint-Tropez par le large comptent tous.</li>
           <li>Le taux se calcule sur l’<b>année civile</b> et vaut pour l’année suivante. Sous 70 %, l’exonération cesse au 1er janvier suivant.</li>
-          <li>Preuves : journal de bord, traces GPS ou AIS. La location à quai doit rester inférieure à la moitié des contrats de l’année.</li>
+          <li><b>Charters à quai</b> : ils ne créent pas de trajet, mais la location à quai doit rester <b>inférieure à la moitié des contrats</b> de l’année (cochez « Charter à quai » dans la fiche du charter).</li>
+          <li>Preuves : journal de bord, traces GPS ou AIS.</li>
         </ul>
         <p class="muted small">Calcul indicatif, à valider avec votre représentant fiscal.</p>
       </section>`);

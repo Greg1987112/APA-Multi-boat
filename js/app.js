@@ -2296,35 +2296,39 @@
     const lines = String(text || '').split(/\n/).map(l => l.toUpperCase().replace(/[«‹(\[{]/g, '<').replace(/\s+/g, '').replace(/[^A-Z0-9<]/g, ''))
       .filter(l => l.length >= 24);
     const D = '[0-9OQDUCILTJZSGBAE]';
-    const core = new RegExp(`(${D}{6})(${D})([MFX<])(${D}{6})(${D})`, 'g');
+    const core = new RegExp(`(${D}{6})(${D})([MFX<HNK4EP])(${D}{6})(${D})`, 'g');
+    const SEX = ch => /[MHNK4]/.test(ch) ? 'M' : /[FEP]/.test(ch) ? 'F' : ch === 'X' ? 'X' : '';
     let best = null;
     lines.forEach((L, i) => {
       for (const m of L.matchAll(core)) {
         const idx = m.index;
         const dobRaw = asDigits(m[1]), dobChk = asDigits(m[2]), expRaw = asDigits(m[4]), expChk = asDigits(m[5]);
         const dobOk = mrzCheck(dobRaw) === dobChk, expOk = mrzCheck(expRaw) === expChk;
-        let doc, docChk, nat, l1, names, type, issuing, rawNames;
-        if (idx >= 13) {           // passeport (TD3) ou ancien format 2 lignes (TD2)
+        let doc, docChk, nat, l1, names, type, issuing, rawNames, docPartial = '';
+        if (idx >= 9) {            // passeport (TD3) ou ancien format 2 lignes (TD2) ; début de ligne parfois coupé sur la photo
           nat = L.slice(idx - 3, idx);
+          if (idx < 13) { docPartial = L.slice(0, idx - 4); docChk = asDigits(L[idx - 4] || ''); doc = docPartial; }
           // n° du document : position normale, ou décalée d'un caractère si la lecture en a ajouté ou perdu un
           for (const off of [0, -1, 1, -2]) {
-            const st = idx - 13 + off; if (st < 0) continue;
+            const st = idx - 13 + off; if (st < 0 || docPartial) continue;
             const dd = L.slice(st, st + 9), cc = asDigits(L[st + 9] || '');
             if (doc === undefined || fixWithCheck(dd, cc).ok) { doc = dd; docChk = cc; if (fixWithCheck(dd, cc).ok) break; }
           }
-          l1 = lines[i - 1] || ''; rawNames = l1.slice(5); names = mrzNames(rawNames); type = l1[0]; issuing = l1.slice(2, 5);
+          l1 = lines[i - 1] || ''; const o1 = l1[0] === '<' ? -1 : 0; // « P » perdu en début de ligne
+          rawNames = l1.slice(5 + o1); names = mrzNames(rawNames); type = o1 ? 'P' : l1[0]; issuing = l1.slice(2 + o1, 5 + o1);
+          if (!COUNTRIES[asAlpha(nat)] && COUNTRIES[asAlpha(issuing)]) nat = issuing;
         } else if (idx <= 1) {     // carte d'identité (TD1, 3 lignes)
           l1 = lines[i - 1] || ''; nat = L.slice(idx + 15, idx + 18);
           doc = l1.slice(5, 14); docChk = asDigits(l1[14] || ''); type = l1[0]; issuing = l1.slice(2, 5);
           rawNames = lines[i + 1] || ''; names = mrzNames(rawNames);
         } else continue;
-        const docFix = fixWithCheck(doc, docChk);
+        const docFix = docPartial ? { v: docPartial, ok: false } : fixWithCheck(doc, docChk);
         const score = (dobOk ? 1 : 0) + (expOk ? 1 : 0) + (docFix.ok ? 1 : 0) + (names.family ? 0.5 : 0);
         if (best && best.score >= score) continue;
-        const dt = type === 'P' ? 'Passport' : /[IAC]/.test(type || '') ? 'Identity card' : (idx >= 13 ? 'Passport' : 'Identity card');
-        best = { score, ok: dobOk && expOk && docFix.ok, rawNames,
+        const dt = type === 'P' || (idx >= 9 && L.length >= 40) ? 'Passport' : /[IAC]/.test(type || '') ? 'Identity card' : (idx >= 9 ? 'Passport' : 'Identity card');
+        best = { score, ok: dobOk && expOk && docFix.ok, dobOk, expOk, docOk: docFix.ok, rawNames, docPartial, docChk,
           fields: { family: names.family, given: names.given, nationality: countryName(asAlpha(nat)), dob: mrzDate(dobRaw, 'dob'),
-            gender: m[3] === '<' ? '' : m[3], doc_type: dt, doc_no: docFix.v.replace(/</g, ''), issuing: countryName(asAlpha(issuing || '')),
+            gender: SEX(m[3]), doc_type: dt, doc_no: docFix.v.replace(/</g, ''), issuing: countryName(asAlpha(issuing || '')),
             expiry: mrzDate(expRaw, 'exp') } };
       }
     });
@@ -2386,14 +2390,20 @@
     }
     cx.putImageData(im, 0, 0); return out;
   }
+  // Profil ligne par ligne des contrastes forts, mesuré sur la largeur utile (marges blanches d'un scan exclues)
   function rowProfile(cv) {
-    const W = cv.width, H = cv.height, g = grayOf(cv), BINS = 24, bw = W / BINS, cnt = new Float32Array(H), bins = new Uint8Array(H), xs = [];
+    const W = cv.width, H = cv.height, g = grayOf(cv), col = new Float64Array(W);
+    for (let y = 0; y < H; y++) { const o = y * W; for (let x = 2; x < W; x++) if (Math.abs(g[o + x] - g[o + x - 2]) > 45) col[x]++; }
+    const tot = col.reduce((a, b) => a + b, 0); let acc = 0, cx0 = 0, cx1 = W - 1;
+    for (let x = 0; x < W; x++) { acc += col[x]; if (acc >= tot * 0.02) { cx0 = x; break; } }
+    acc = 0; for (let x = W - 1; x >= 0; x--) { acc += col[x]; if (acc >= tot * 0.02) { cx1 = x; break; } }
+    const CW = Math.max(1, cx1 - cx0), BINS = 24, bw = CW / BINS, cnt = new Float32Array(H), bins = new Uint8Array(H), xs = [];
     for (let y = 0; y < H; y++) {
       const seen = new Uint8Array(BINS), o = y * W; let c = 0, x0 = W, x1 = 0;
-      for (let x = 2; x < W; x++) if (Math.abs(g[o + x] - g[o + x - 2]) > 45) { c++; seen[Math.min(BINS - 1, (x / bw) | 0)] = 1; if (x < x0) x0 = x; x1 = x; }
+      for (let x = Math.max(2, cx0); x <= cx1; x++) if (Math.abs(g[o + x] - g[o + x - 2]) > 45) { c++; seen[Math.min(BINS - 1, ((x - cx0) / bw) | 0)] = 1; if (x < x0) x0 = x; x1 = x; }
       cnt[y] = c; bins[y] = seen.reduce((a, b) => a + b, 0); xs.push([x0, x1]);
     }
-    return { cnt, bins, xs, BINS };
+    return { cnt, bins, xs, BINS, CW };
   }
   function mrzBand(src, rot) {
     const up = rot ? rotCanvas(src, rot) : src, k = Math.min(1, 640 / up.width);
@@ -2402,7 +2412,7 @@
     for (let a = -6; a <= 6; a += 1.5) tryA(a);
     const a0 = best.a; tryA(a0 - 0.75); tryA(a0 + 0.75);
     const { a, sm, pr } = best, H = sm.height, mx = Math.max(...pr.cnt);
-    const ok = y => pr.bins[y] >= pr.BINS * 0.4 && pr.cnt[y] >= mx * 0.3 && pr.xs[y][1] - pr.xs[y][0] >= sm.width * 0.45;
+    const ok = y => pr.bins[y] >= pr.BINS * 0.4 && pr.cnt[y] >= mx * 0.3 && pr.xs[y][1] - pr.xs[y][0] >= pr.CW * 0.45;
     const quiet = (y0, y1) => { let t = 0, n = 0; for (let y = Math.max(0, y0); y <= Math.min(H - 1, y1); y++) { t += pr.cnt[y]; n++; } return !n || t / n < mx * 0.15; };
     const lines = []; let cur = null;
     for (let y = 0; y < H; y++) {
@@ -2441,6 +2451,7 @@
         if (OTHER_LABEL.test(cand) && !/[A-Z]{4,}/.test(cand.replace(OTHER_LABEL, ''))) continue;
         let v = cand.replace(/[^A-Za-zÀ-ÖØ-öø-ÿ ,.'\/-]/g, ' ').replace(/\s+/g, ' ').trim();
         v = v.replace(/(\s+[A-Za-z]{1,2})+$/, '').replace(/^[^A-Za-zÀ-ÿ]+|[\s,\/-]+$/g, '').trim();
+        if (/LIEU|NAIS|BIRTH|PLACE|LUGAR|NACIM|LUOGO|NASCI|GEBURT/i.test(v)) continue; // intitulé mal lu, pas une valeur
         if (v.replace(/[^A-Za-zÀ-ÿ]/g, '').length >= 3) return v.toUpperCase().slice(0, 50);
       }
     }
@@ -2451,7 +2462,8 @@
     const T = ' ' + String(text || '').toUpperCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/[^A-Z]+/g, ' ') + ' ';
     const has = w => w && w.length >= 2 && T.includes(' ' + w + ' ');
     const f = r.fields, firstGiven = (f.given || '').split(' ')[0];
-    if (has(f.family.split(' ')[0]) && (!firstGiven || has(firstGiven))) return;
+    const trimWord = w => { if (has(w)) return w; for (let n = w.length - 1; n >= 3; n--) if (has(w.slice(0, n))) return w.slice(0, n); return w; };
+    if (has(f.family.split(' ')[0])) { f.given = (f.given || '').split(' ').filter(Boolean).map(trimWord).join(' '); if (!firstGiven || has(f.given.split(' ')[0])) return; }
     const s = asAlpha(String(r.rawNames || '')), clean = x => x.replace(/</g, ' ').replace(/\s+/g, ' ').trim();
     for (let i = 1; i < s.length - 2; i++) {
       if (!/[<KCLS]/.test(s[i]) || !/[<KCLS]/.test(s[i + 1])) continue;
@@ -2462,6 +2474,67 @@
       }
     }
   }
+  // ---- Lecture de la page imprimée (zone visuelle) : intitulés multilingues, valeur sur la ligne suivante
+  const MONTHS = [[1, 'JAN|JANV|ENE|GEN|JAN'], [2, 'FEB|FEV|FÉV|FEVR|FÉVR|FEBR'], [3, 'MAR|MARS|MÄR|MRZ'], [4, 'APR|AVR|ABR'], [5, 'MAY|MAI|MAG|MAYO'], [6, 'JUN|JUIN|GIU'],
+    [7, 'JUL|JUIL|LUG'], [8, 'AUG|AOU|AOÛ|AOUT|AOÛT|AGO'], [9, 'SEP|SEPT|SET'], [10, 'OCT|OTT|OKT'], [11, 'NOV'], [12, 'DEC|DÉC|DIC|DEZ']];
+  function visDate(line) {
+    const L = String(line || '').toUpperCase().replace(/[|]/g, '/');
+    let m = L.match(/\b(\d{1,2})\s*[ ./-]?\s*([A-ZÀ-Ü]{3,5})(?:\s*\/\s*[A-ZÀ-Ü]{3,5})?\s*[ ./-]?\s*(\d{4}|\d{2})\b/);
+    if (m) {
+      const mo = MONTHS.find(([, re]) => new RegExp(`^(${re})`).test(m[2]));
+      if (mo) { let y = +m[3]; if (m[3].length === 2) y += y > new Date().getFullYear() % 100 + 15 ? 1900 : 2000;
+        const d = +m[1]; if (d >= 1 && d <= 31) return `${y}-${String(mo[0]).padStart(2, '0')}-${String(d).padStart(2, '0')}`; }
+    }
+    m = L.match(/\b(\d{2})[ ./-](\d{2})[ ./-](\d{4})\b/);
+    if (m && +m[2] >= 1 && +m[2] <= 12 && +m[1] >= 1 && +m[1] <= 31) return `${m[3]}-${m[2]}-${m[1]}`;
+    return '';
+  }
+  const LBL = {
+    family: /surname|\bnom\b|cognome|apellidos|nachname|familienname/i,
+    given: /given\s*names?|pr[ée]noms|\bnomi\b|nombres|vornamen/i,
+    nationality: /nationality|nationalit[ée]|nazionalit|nacionalidad|staatsangeh/i,
+    dob: /date\s*of\s*birth|date\s*de\s*naissance|data\s*di\s*nascita|fecha\s*de\s*nac|geburtstag/i,
+    expiry: /date\s*of\s*expir|expiry|date\s*d.\s*expiration|scadenza|caducidad|g[üu]ltig\s*bis|expiration/i,
+    issue: /date\s*of\s*issue|d[ée]livrance|rilascio|expedici[oó]n|ausstellung/i,
+    docno: /passport\s*n|n[°o.]\s*du\s*passeport|passaporto\s*n|pasaporte|pass-?nr|document\s*n/i,
+    sex: /\bsex\b|sexe|sesso|sexo|geschlecht/i,
+  };
+  const ANY_LBL = new RegExp(Object.values(LBL).map(r => r.source).join('|') + '|place\\s*of\\s*birth|lieu\\s*de|authority|autorit|type|code|signature', 'i');
+  const cleanName = v => String(v || '').replace(/[^A-Za-zÀ-ÖØ-öø-ÿ' -]/g, ' ').replace(/\s+/g, ' ').trim().toUpperCase();
+  function parseVisual(text) {
+    const lines = String(text || '').split('\n').map(l => l.trim()).filter(Boolean), out = {};
+    const after = (re, ok) => {
+      for (let i = 0; i < lines.length; i++) {
+        if (!re.test(lines[i])) continue;
+        for (const cand of lines.slice(i + 1, i + 3)) { if (ANY_LBL.test(cand) && !ok(cand, true)) continue; const v = ok(cand); if (v) return v; }
+      }
+      return '';
+    };
+    out.family = after(LBL.family, (c, lbl) => { if (lbl || c.includes('<')) return ''; const v = cleanName(c); return v.replace(/[^A-Z]/g, '').length >= 2 ? v : ''; });
+    out.given = after(LBL.given, (c, lbl) => { if (lbl || c.includes('<')) return ''; const v = cleanName(c); return v.replace(/[^A-Z]/g, '').length >= 2 ? v : ''; });
+    out.nationality = after(LBL.nationality, (c, lbl) => { if (lbl) return ''; const v = cleanName(c); return v.length >= 3 ? v : ''; });
+    out.dob = after(LBL.dob, c => visDate(c));
+    out.expiry = after(LBL.expiry, c => visDate(c));
+    out.doc_no = after(LBL.docno, c => { const t = (c.toUpperCase().match(/\b[A-Z0-9]{6,10}\b/g) || []).filter(x => /\d{4}/.test(x)); return t.length ? t[t.length - 1] : ''; });
+    out.gender = after(LBL.sex, c => { const m = c.toUpperCase().match(/(?:^|\s)([MF])(?:\s*\/\s*[MF])?\s*$/); return m ? m[1] : ''; });
+    out.pob = parsePob(text);
+    if (out.nationality) { const n = out.nationality.toUpperCase(); const hit = Object.values(COUNTRIES).find(x => x.toUpperCase() === n);
+      out.nationality = hit || (/UNITED STATES/.test(n) ? 'United States' : out.nationality.toLowerCase().replace(/\b\w/g, ch => ch.toUpperCase())); }
+    out.count = ['family', 'given', 'dob', 'expiry', 'doc_no'].filter(k => out[k]).length;
+    return out;
+  }
+  // Recadre la page sur le document (marges blanches d'un scan retirées), ~1800 px de large
+  function contentCanvas(src) {
+    const k = Math.min(1, 640 / src.width), sm = rotCanvas(src, 0, k), g = grayOf(sm), W = sm.width, H = sm.height, col = new Float64Array(W), row = new Float64Array(H);
+    for (let y = 0; y < H; y++) for (let x = 2; x < W; x++) if (Math.abs(g[y * W + x] - g[y * W + x - 2]) > 30) { col[x]++; row[y]++; }
+    const q = (arr, lo) => { const tot = arr.reduce((a, b) => a + b, 0); let acc = 0; if (lo) { for (let i = 0; i < arr.length; i++) { acc += arr[i]; if (acc >= tot * 0.01) return i; } return 0; }
+      for (let i = arr.length - 1; i >= 0; i--) { acc += arr[i]; if (acc >= tot * 0.01) return i; } return arr.length - 1; };
+    const x0 = Math.max(0, q(col, true) - 10) / k, x1 = Math.min(W, q(col, false) + 10) / k, y0 = Math.max(0, q(row, true) - 10) / k, y1 = Math.min(H, q(row, false) + 10) / k;
+    const z = Math.min(2.5, 1800 / (x1 - x0));
+    const cv = document.createElement('canvas'); cv.width = Math.round((x1 - x0) * z); cv.height = Math.round((y1 - y0) * z);
+    const cx = cv.getContext('2d', { willReadFrequently: true }); cx.imageSmoothingQuality = 'high'; cx.drawImage(src, x0, y0, x1 - x0, y1 - y0, 0, 0, cv.width, cv.height);
+    return enhance(cv);
+  }
   async function readPassport(file, onStep) {
     const name = file.name.toLowerCase();
     let sources;
@@ -2470,40 +2543,61 @@
     await loadScript(TESS_JS);
     const worker = await window.Tesseract.createWorker('eng', 1, { ...TESS_OPTS });
     const MRZ_PARAMS = { tessedit_char_whitelist: 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789<', tessedit_pageseg_mode: '6' };
-    await worker.setParameters(MRZ_PARAMS);
-    let best = null, step = 0, upright = null;
+    let mrz = null, step = 0, upright = null, vis = null, full = '';
     const tryCanvas = async (cv, up) => {
       onStep && onStep(++step);
       const r = parseMRZ((await worker.recognize(cv)).data.text);
-      if (r && (!best || r.score > best.score)) { best = r; upright = up; }
-      return best && best.ok;
+      if (r && (!mrz || r.score > mrz.score)) { mrz = r; upright = up; }
+      return mrz && mrz.ok;
     };
     try {
+      // 1) bande MRZ : sert à contrôler les chiffres (dates, n°) grâce à ses chiffres de contrôle, et à redresser la page
+      await worker.setParameters(MRZ_PARAMS);
       search: for (const src of sources) {
-        for (const rot of [0, 180, 90, 270]) {               // 1) bande MRZ repérée et redressée
+        for (const rot of [0, 180, 90, 270]) {
           const band = mrzBand(src, rot);
           if (band && (await tryCanvas(band.bin, band.upright) || await tryCanvas(band.cv, band.upright))) break search;
         }
-        for (const [rot, top] of [[0, 0.55], [0, 0]]) {       // 2) secours : bas de l'image, puis image entière
-          if (await tryCanvas(mrzCanvas(src, rot, top), null)) break search;
-        }
+        for (const [rot, top] of [[0, 0.55], [0, 0]]) if (await tryCanvas(mrzCanvas(src, rot, top), null)) break search;
       }
-      // 3) lieu de naissance dans la zone visuelle (lecture libre de la page redressée)
-      if (best && best.score >= 2) {
-        try {
-          onStep && onStep(++step);
-          await worker.setParameters({ tessedit_char_whitelist: '', tessedit_pageseg_mode: '3' });
-          const page = upright || sources[0], z = Math.min(1, 1800 / page.width);
-          const cv = document.createElement('canvas'); cv.width = Math.round(page.width * z); cv.height = Math.round(page.height * z);
-          cv.getContext('2d').drawImage(page, 0, 0, cv.width, cv.height);
-          const full = (await worker.recognize(enhance(cv))).data.text;
-          const pob = parsePob(full);
-          if (pob) { best.fields.pob = pob; best.pobAuto = true; }
-          fixNames(best, full);
-        } catch (e) { console.warn(e); }
+      // 2) page imprimée : noms, lieu de naissance, et dates / n° quand la bande est illisible
+      await worker.setParameters({ tessedit_char_whitelist: '', tessedit_pageseg_mode: '3' });
+      const pages = upright ? [upright] : sources.flatMap(s => [s, rotCanvas(s, 90), rotCanvas(s, 270), rotCanvas(s, 180)]);
+      for (const pg of pages) {
+        onStep && onStep(++step);
+        const cv = contentCanvas(pg);
+        await worker.setParameters({ tessedit_pageseg_mode: '11' });
+        const t1 = (await worker.recognize(binarize(cv, 25))).data.text;
+        await worker.setParameters({ tessedit_pageseg_mode: '3' });
+        const t2 = (await worker.recognize(cv)).data.text;
+        const t = t1 + '\n' + t2, v1 = parseVisual(t1), v2 = parseVisual(t2), v = {};
+        Object.keys({ ...v1, ...v2 }).forEach(k => { v[k] = v2[k] || v1[k]; });
+        v.count = ['family', 'given', 'dob', 'expiry', 'doc_no'].filter(k => v[k]).length;
+        if (!vis || v.count > vis.count) { vis = v; full = t; }
+        if (vis.count >= 4) break;
       }
     } finally { await worker.terminate(); }
-    return best && best.score >= 1 ? best : null;
+    if (!mrz && (!vis || vis.count < 2)) return null;
+    // 3) fusion : chiffres validés par la bande en priorité, noms et lieu de naissance de la page imprimée
+    const M = mrz ? mrz.fields : {}, V = vis || {}, f = {};
+    if (mrz && full) fixNames(mrz, full);
+    // noms : bande du bas recoupée avec la page (la lecture seule de la page est trop sensible aux fonds sécurisés)
+    f.family = (mrz && M.family) || V.family || ''; f.given = (mrz && M.family ? M.given : V.given) || '';
+    // une date de la bande n'est reprise que si son chiffre de contrôle est bon ; sinon celle de la page, sinon vide
+    f.dob = (mrz?.dobOk && M.dob) || V.dob || '';
+    f.expiry = (mrz?.expOk && M.expiry) || V.expiry || '';
+    if (mrz?.docPartial) { // n° coupé sur la photo : on le retrouve sur la page imprimée (chiffre de contrôle à l'appui)
+      const tok = (full.toUpperCase().match(/[A-Z0-9]{6,10}/g) || []).find(x => x.endsWith(mrz.docPartial) && x.length > mrz.docPartial.length && mrzCheck(x.padEnd(9, '<').slice(0, 9)) === mrz.docChk);
+      if (tok) { M.doc_no = tok; mrz.docOk = true; mrz.ok = mrz.dobOk && mrz.expOk; }
+    }
+    f.doc_no = (mrz?.docOk && M.doc_no) || V.doc_no || (mrz?.docPartial ? '' : M.doc_no) || '';
+    f.gender = M.gender || V.gender || '';
+    const known = n => n && COUNTRY_NAMES.includes(n);
+    f.nationality = (known(M.nationality) && M.nationality) || (known(V.nationality) && V.nationality) || (known(M.issuing) && M.issuing) || '';
+    f.issuing = (known(M.issuing) && M.issuing) || f.nationality; f.doc_type = M.doc_type || 'Passport';
+    if (V.pob) f.pob = V.pob;
+    const ok = !!mrz?.ok;
+    return { ok, score: (mrz?.score || 0) + (V.count || 0), fields: f, pobAuto: !!V.pob };
   }
 
   // ---- Mouvements de passagers (embarquements / débarquements) et trajets

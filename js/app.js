@@ -2916,15 +2916,21 @@
   }
 
   // ---- Export : IMO FAL Form 6 (PDF A4 paysage, 12 passagers par page) et Excel, pour un départ ou une arrivée donnés
-  function falPoints(c) {
-    const V = voyageOf(c), pts = [];
-    V.stops.forEach((s, i) => {
-      const before = i > 0 ? V.onBoardAfter(i - 1) : [], after = V.onBoardAfter(i);
-      if (before.length) pts.push({ direction: 'arrival', port: s.port, date: s.date, guests: before, label: `Arrival — ${fdate(s.date)} ${s.port || ''} (${before.length} pax)` });
-      if (after.length) pts.push({ direction: 'departure', port: s.port, date: s.date, guests: after, label: `Departure — ${fdate(s.date)} ${s.port || ''} (${after.length} pax)` });
-    });
-    return pts;
+  // Périodes du charter entre deux escales (embarquement / débarquement) : passagers à bord pendant chacune
+  function falSegments(c) {
+    const V = voyageOf(c), segs = [];
+    for (let i = 0; i < V.stops.length - 1; i++) {
+      const guests = V.onBoardAfter(i); if (!guests.length) continue;
+      const a = V.stops[i], b = V.stops[i + 1];
+      segs.push({ from: a, to: b, guests });
+    }
+    if (!segs.length) { const G = guestsOf(c), M = guestMeta(c);
+      if (G.length) segs.push({ from: { date: c.start_date, port: M.port_emb }, to: { date: c.end_date || c.start_date, port: M.port_dis }, guests: G }); }
+    return segs;
   }
+  const segPoint = (sg, dir) => { const p = dir === 'arrival' ? sg.to : sg.from;
+    return { direction: dir, port: p.port, date: p.date, guests: sg.guests, period: `Du ${fdate(sg.from.date).slice(0, 5)} au ${fdate(sg.to.date).slice(0, 5)}`,
+      label: `${dir === 'arrival' ? 'Arrival' : 'Departure'} — ${fdate(p.date)} ${p.port || ''} (${sg.guests.length} pax)` }; };
   function falRows(c, guests) {
     const M = guestMeta(c);
     return guests.map(({ g }) => { const mv = guestMoves(c, g, M);
@@ -2988,12 +2994,13 @@
   // Chaque liste éditée est archivée dans la Guest List (stockage privé) pour la retrouver plus tard
   async function archiveList(c, pt, out, kind) {
     const up = await api.uploadPrivate(new File([out.blob], out.name, { type: out.blob.type }), `guest-lists/${c.id}`);
-    await api.insert('charter_documents', { charter_id: c.id, folder: 'guest_lists', title: pt.label.replace(/\s*\(\d+ pax\)$/, ''), ...up,
+    await api.insert('charter_documents', { charter_id: c.id, folder: 'guest_lists', title: (pt.period ? pt.period + ' · ' : '') + pt.label.replace(/\s*\(\d+ pax\)$/, ''), ...up,
       note: JSON.stringify({ direction: pt.direction, port: pt.port, date: pt.date, pax: pt.guests.length, kind, names: pt.guests.map(x => [x.g.family, x.g.given].filter(Boolean).join(' ')) }) });
   }
   // Choix du départ / de l'arrivée à éditer (direct s'il n'y en a qu'un)
   function pickFalPoint(c, kind) {
-    const pts = falPoints(c);
+    const segs = falSegments(c);
+    if (!segs.length) return toast('Ajoutez d’abord des passagers', 'err');
     const run = async (pt, btn) => {
       busy(btn, true);
       let out;
@@ -3004,15 +3011,19 @@
       catch (e) { toast(`Liste téléchargée mais non archivée : ${errMsg(e)}`, 'err'); }
       saveBlob(out.blob, out.name);
     };
-    if (!pts.length) { // secours : tous les passagers, au départ du charter
-      const G = guestsOf(c), M = guestMeta(c);
-      if (!G.length) return toast('Ajoutez d’abord des passagers', 'err');
-      pts.push({ direction: 'departure', port: M.port_emb, date: c.start_date, guests: G, label: `Departure — ${fdate(c.start_date)} ${M.port_emb || ''} (${G.length} pax)` });
-    }
+    const short = d => fdate(d).slice(0, 5);
     const m = openModal({ title: `Passenger List (FAL 6) — ${kind === 'pdf' ? 'PDF' : 'Excel'}`,
-      body: `<p class="muted small">Choisissez le départ ou l’arrivée : la liste contient les passagers à bord à ce moment-là.</p>
-        <div class="fal-points">${pts.map((p, i) => `<button class="btn ${p.direction === 'departure' ? 'btn-primary' : 'btn-ghost'} btn-block" data-pt="${i}">${esc(p.label)}</button>`).join('')}</div>` });
-    $$('[data-pt]', m).forEach(b => b.addEventListener('click', () => run(pts[+b.dataset.pt], b)));
+      body: `<div class="seg fal-dir" role="radiogroup" aria-label="Type de liste">
+          <label><input type="radio" name="fal-dir" value="departure" checked> <span>Departure (départ)</span></label>
+          <label><input type="radio" name="fal-dir" value="arrival"> <span>Arrival (arrivée)</span></label></div>
+        <p class="muted small">Choisissez la période : la liste contient les passagers à bord pendant ces dates.</p>
+        <div class="fal-points">${segs.map((sg, i) => `<button class="btn btn-ghost btn-block fal-seg" data-seg="${i}">
+          <b>Du ${short(sg.from.date)} au ${short(sg.to.date)}</b>
+          <span class="muted small">${esc(sg.from.port || '?')} → ${esc(sg.to.port || '?')} · ${sg.guests.length} pax</span></button>`).join('')}</div>` });
+    $$('[data-seg]', m).forEach(b => b.addEventListener('click', () => {
+      const dir = $('input[name=fal-dir]:checked', m).value;
+      run(segPoint(segs[+b.dataset.seg], dir), b);
+    }));
   }
   ACTIONS['fal6-pdf'] = () => pickFalPoint(charterById(CURRENT), 'pdf');
   ACTIONS['fal6-xlsx'] = () => pickFalPoint(charterById(CURRENT), 'xlsx');

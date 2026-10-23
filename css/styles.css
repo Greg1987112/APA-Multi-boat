@@ -723,3 +723,8 @@ td.warn { color: var(--warn); }
 .vat-mention [lang=en] { color: var(--muted); font-style: italic; }
 .vat-proof .link-btn { display: inline-flex; gap: 6px; align-items: center; font-size: .82rem; text-align: left; }
 .vat-proof .file-btn.is-busy { opacity: .6; pointer-events: none; }
+.fal-dir { margin-bottom: 10px; }
+.fal-dir label { display: flex; gap: 6px; align-items: center; padding: 8px 14px; cursor: pointer; font-weight: 600; font-size: .9rem; }
+.fal-dir label:has(input:checked) { background: var(--gold-soft); color: var(--gold); }
+.fal-dir input { accent-color: var(--gold); margin: 0; width: auto; }
+.fal-seg { display: flex; flex-direction: column; align-items: flex-start; gap: 2px; text-align: left; height: auto; padding-block: 10px; }

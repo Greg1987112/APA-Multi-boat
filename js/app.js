@@ -29,6 +29,10 @@
   const CATEGORIES = ['Food', 'Drinks', 'Cigarette', 'Laundry', 'Berth', 'Hygiene', 'Medical', 'Fuel',
     'Agent Fee', 'Transport', 'Miscellaneous', 'Baby & Kid', 'Garbage', 'Administrative', 'Local Tax',
     'Bank Fee', 'TIPS', 'ATM fee'];
+  // Carte des vins : rubriques (clé, français, anglais) et formats de bouteille
+  const CELLAR_CATS = [['champagne', 'Champagne', 'Champagne'], ['white', 'Vins blancs', 'White wine'], ['rose', 'Vins rosés', 'Rosé wine'],
+    ['red', 'Vins rouges', 'Red wine'], ['spirits', 'Spiritueux', 'Spirits']];
+  const CELLAR_SIZES = { '37.5cl': '37,5 cl', '75cl': '75 cl', '1.5L': 'Magnum 1,5 L', '3L': 'Jéroboam 3 L', '70cl': '70 cl', '1L': '1 L' };
 
   // ------------------------------------------------------------------
   //  Utilitaires
@@ -111,7 +115,8 @@
       wxRain: 'Pluie', wxWater: 'Eau', wxSun: 'Soleil', wxUv: 'UV', wxNA: 'Prévisions disponibles environ 15 jours avant la date.', wxLoading: 'Chargement de la météo…',
       startsIn: 'Votre charter commence dans {n} jour(s) — aperçu du premier jour', menuSoon: 'Menu communiqué prochainement',
       wx_sunny: 'Ensoleillé', wx_partly: 'Éclaircies', wx_cloudy: 'Nuageux', wx_fog: 'Brouillard', wx_drizzle: 'Bruine', wx_rain: 'Pluie', wx_snow: 'Neige', wx_showers: 'Averses', wx_storm: 'Orages',
-      tabAccounts: 'Comptes', tabItinerary: 'Itinéraire', programme: 'Programme', trip: 'Trajet', dayShort: 'Jour', allDays: 'Tout', playRoute: '▶ Voir le parcours',
+      tabAccounts: 'Comptes', tabItinerary: 'Itinéraire', tabWines: 'Vins & spiritueux', wineList: 'Carte des vins', wineIntro: 'Les bouteilles qu’il vous reste à bord, mises à jour par l’équipage.',
+      bottles: 'bouteilles', bottle: 'bouteille', finished: 'Terminé', nv: 'NV', winesUpdated: 'Mis à jour', cellarEmpty: 'La carte des vins sera bientôt disponible.', programme: 'Programme', trip: 'Trajet', dayShort: 'Jour', allDays: 'Tout', playRoute: '▶ Voir le parcours',
       sailingTime: 'de navigation', mapPlan: 'Plan', routeNote: 'Routes indicatives selon le programme prévu (peuvent évoluer selon la météo et les conditions de mer).',
       nowSailing: 'Aujourd’hui : en navigation (position prévue)', nowBefore: 'Aujourd’hui : avant le départ du jour', nowArrived: 'Aujourd’hui : arrivé à l’escale du jour',
     },
@@ -156,7 +161,8 @@
       wxRain: 'Rain', wxWater: 'Water', wxSun: 'Sun', wxUv: 'UV', wxNA: 'Forecast available about 15 days before the date.', wxLoading: 'Loading weather…',
       startsIn: 'Your charter starts in {n} day(s) — preview of day one', menuSoon: 'Menu to be announced',
       wx_sunny: 'Sunny', wx_partly: 'Partly cloudy', wx_cloudy: 'Cloudy', wx_fog: 'Fog', wx_drizzle: 'Drizzle', wx_rain: 'Rain', wx_snow: 'Snow', wx_showers: 'Showers', wx_storm: 'Thunderstorms',
-      tabAccounts: 'Accounts', tabItinerary: 'Itinerary', programme: 'Programme', trip: 'Trip', dayShort: 'Day', allDays: 'All', playRoute: '▶ Play the route',
+      tabAccounts: 'Accounts', tabItinerary: 'Itinerary', tabWines: 'Wines & Spirits', wineList: 'Wine list', wineIntro: 'The bottles you have left on board, kept up to date by the crew.',
+      bottles: 'bottles', bottle: 'bottle', finished: 'Finished', nv: 'NV', winesUpdated: 'Updated', cellarEmpty: 'The wine list will be available soon.', programme: 'Programme', trip: 'Trip', dayShort: 'Day', allDays: 'All', playRoute: '▶ Play the route',
       sailingTime: 'sailing', mapPlan: 'Map', routeNote: 'Indicative routes as per the planned programme (subject to weather and sea conditions).',
       nowSailing: 'Today: under way (planned position)', nowBefore: 'Today: before the day’s departure', nowArrived: 'Today: arrived at the day’s stop',
     },
@@ -380,6 +386,10 @@
       const { data, error } = await this.sb.rpc('client_itinerary', { p_token: token });
       if (error) return null; return data;
     }
+    async clientCellar(token) {
+      const { data, error } = await this.sb.rpc('client_cellar', { p_token: token });
+      if (error) return null; return data;
+    }
     async reportView(token) {
       const { data, error } = await this.sb.rpc('report_view', { p_token: token });
       if (error) throw error; return data;
@@ -510,6 +520,12 @@
       const { client_token, notes, signed_snapshot, report_token, report_to, report_cc, ...pub } = c; // eslint-disable-line no-unused-vars
       return { ...B, charter: pub, invoices: B.invoices.map(({ fingerprint, ...i }) => i) }; // eslint-disable-line no-unused-vars
     }
+    async clientCellar(token) {
+      const c = this.S.charters.find(x => x.client_token === token); if (!c) return null;
+      const d = (this.S.charter_documents || []).find(x => x.charter_id === c.id && x.folder === 'cellar');
+      let p = null; try { p = d?.note ? JSON.parse(d.note) : null; } catch { p = null; }
+      return p && p.share_client !== false ? p : null;
+    }
     async clientItinerary(token) {
       const c = this.S.charters.find(x => x.client_token === token); if (!c) return null;
       const d = (this.S.charter_documents || []).find(x => x.charter_id === c.id && x.folder === 'itinerary_plan');
@@ -557,6 +573,7 @@
   const svg = p => `<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${p}</svg>`;
   const ICON = {
     file: svg('<path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h5"/>'),
+    wine: svg('<path d="M8 3h8l-.5 6a3.5 3.5 0 0 1-7 0z"/><path d="M12 12.5V20M8.5 20.5h7"/>'),
     fork: svg('<circle cx="6" cy="5" r="2"/><circle cx="18" cy="5" r="2"/><circle cx="12" cy="19" r="2"/><path d="M6 7v2a3 3 0 0 0 3 3h6a3 3 0 0 0 3-3V7M12 12v5"/>'),
     sun: svg('<circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/>'),
     map: svg('<path d="M9 4 3 6v14l6-2 6 2 6-2V4l-6 2z"/><path d="M9 4v14M15 6v14"/>'),
@@ -1253,7 +1270,7 @@
     LANG = store.get('ca-lang') || ((navigator.language || 'en').toLowerCase().startsWith('fr') ? 'fr' : 'en');
     document.documentElement.lang = LANG;
     let B = null, lastAt = null, inflight = false, prevStatus = null;
-    let PLAN = null, planStr = '', CTAB = 'accounts', firstLoad = true, HOME_DATE = null, CLIENT_CTL = null;
+    let PLAN = null, planStr = '', CTAB = 'accounts', firstLoad = true, HOME_DATE = null, CLIENT_CTL = null, CELLAR = null, cellarStr = '';
 
     async function refresh() {
       if (inflight) return; inflight = true;
@@ -1264,14 +1281,18 @@
         const np = newPlan ? JSON.stringify({ ...newPlan, track: null }) : '', planChanged = np !== planStr;
         const liveChanged = JSON.stringify(newPlan?.track?.slice(-1) || null) !== JSON.stringify(PLAN?.track?.slice(-1) || null);
         PLAN = newPlan && ((newPlan.legs || []).length || Object.keys(newPlan.days || {}).length) ? newPlan : null; planStr = np;
+        let newCellar = null; if (!REPORT && api.clientCellar) { try { newCellar = await api.clientCellar(token); } catch { newCellar = null; } }
+        CELLAR = newCellar && (newCellar.items || []).length ? newCellar : null;
+        const cs = CELLAR ? JSON.stringify(CELLAR) : '', cellarChanged = cs !== cellarStr; cellarStr = cs;
         if (firstLoad && B) { firstLoad = false; // à l'ouverture : page d'accueil du jour pendant le charter (et juste avant)
           const ds = PLAN ? planDates(B.charter, PLAN) : [], td = localToday();
           if (ds.length && td <= ds[ds.length - 1] && dayDiff(ds[0], td) <= 7) CTAB = 'home';
-          else { const saved = store.get('ca-tab-' + token); if (saved && saved !== 'home' && (saved !== 'itin' || PLAN)) CTAB = saved; } }
+          else { const saved = store.get('ca-tab-' + token); if (saved && saved !== 'home' && (saved !== 'itin' || PLAN) && (saved !== 'wines' || CELLAR)) CTAB = saved; } }
+        if (CTAB === 'wines' && !CELLAR) CTAB = 'accounts';
         if (CTAB === 'itin' && !(PLAN && (PLAN.legs || []).length)) CTAB = 'accounts';
         if (CTAB === 'home' && !PLAN) CTAB = 'accounts';
         const quiet = CTAB !== 'accounts' && $('#client-tab-body');
-        if (!$('#modal-root').innerHTML && !(quiet && !planChanged && prevB === JSON.stringify(B))) render();
+        if (!$('#modal-root').innerHTML && !(quiet && !planChanged && !cellarChanged && prevB === JSON.stringify(B))) render();
         else if (liveChanged) { CLIENT_CTL?.setTrack?.(PLAN.track); updateLiveLine(); }
         if (!REPORT) maybeAnnounceClosed();
       } catch (e) { if (!B) renderError(errMsg(e)); }
@@ -1308,6 +1329,20 @@
 
     const TX = () => ({ day: t('dayShort'), all: t('allDays'), play: t('playRoute'), sailing: t('sailingTime'), satellite: 'Satellite', plan: t('mapPlan'),
       nowSailing: t('nowSailing'), nowBefore: t('nowBefore'), nowArrived: t('nowArrived'), liveNow: t('liveNow'), lastKnown: t('lastKnown') });
+    // Carte des vins (lecture seule pour le client)
+    function wineListHtml(cel, lang) {
+      const sections = CELLAR_CATS.map(([k, fr, en]) => {
+        const items = (cel.items || []).filter(i => i.cat === k).sort((a, b) => (b.qty > 0) - (a.qty > 0) || String(a.name).localeCompare(String(b.name)));
+        if (!items.length) return '';
+        return `<section class="wl-sec"><h2>${esc(lang === 'fr' ? fr : en)}</h2>
+          ${items.map(i => `<div class="wl-row ${i.qty > 0 ? '' : 'wl-out'}"><div class="wl-name"><b>${esc(i.name)}</b>${i.size && i.size !== '75cl' ? ` <small>${esc(CELLAR_SIZES[i.size] || i.size)}</small>` : ''}</div>
+            <span class="wl-dots" aria-hidden="true"></span><span class="wl-year">${esc(i.year || (k === 'spirits' ? '' : t('nv')))}</span>
+            <span class="wl-qty">${i.qty > 0 ? `${i.qty} ${i.qty > 1 ? t('bottles') : t('bottle')}` : t('finished')}</span></div>`).join('')}</section>`;
+      }).join('');
+      return `<div class="wine-list card"><div class="wl-head"><div class="eyebrow">${esc(B.charter.yacht || YACHT)}</div><h1>${t('wineList')}</h1><p class="muted">${t('wineIntro')}</p></div>
+        ${sections || `<p class="muted center">${t('cellarEmpty')}</p>`}
+        ${cel.updated_at ? `<p class="muted small center">${t('winesUpdated')} ${fdatetime(cel.updated_at)}</p>` : ''}</div>`;
+    }
     function clientItinHtml(c) {
       const P = computePlan(c, PLAN);
       return `<section class="panel route-panel"><div class="panel-head"><h2>${t('tabItinerary')}</h2>
@@ -1421,7 +1456,7 @@
       </header>
       <main class="container">
         <section class="hero">
-          <div class="eyebrow">${REPORT ? t('reportTitle') : PLAN && CTAB !== 'accounts' ? esc(c.yacht || YACHT) : t('statement')}</div>
+          <div class="eyebrow">${REPORT ? t('reportTitle') : (PLAN || CELLAR) && CTAB !== 'accounts' ? esc(c.yacht || YACHT) : t('statement')}</div>
           <h1>${esc(c.title)}</h1>
           <p class="muted">${esc(c.client_name || '')}${c.client_name ? ' · ' : ''}${fdate(c.start_date)} → ${fdate(c.end_date)}</p>
           <div class="hero-actions no-print">
@@ -1431,11 +1466,13 @@
             ${closed ? `<button class="btn btn-gold" data-act="sign">${ICON.pen}${t('signCta')}</button>` : ''}
           </div>
         </section>
-        ${PLAN ? `<nav class="folder-tabs client-tabs no-print">
-          <a href="#" data-ctab="home" class="folder-tab ${CTAB === 'home' ? 'on' : ''}">${ICON.sun}<span><b>${t('tabHome')}</b></span></a>
+        ${PLAN || CELLAR ? `<nav class="folder-tabs client-tabs no-print">
+          ${PLAN ? `<a href="#" data-ctab="home" class="folder-tab ${CTAB === 'home' ? 'on' : ''}">${ICON.sun}<span><b>${t('tabHome')}</b></span></a>` : ''}
           <a href="#" data-ctab="accounts" class="folder-tab ${CTAB === 'accounts' ? 'on' : ''}">${ICON.sheet}<span><b>${t('tabAccounts')}</b></span></a>
-          ${(PLAN.legs || []).length ? `<a href="#" data-ctab="itin" class="folder-tab ${CTAB === 'itin' ? 'on' : ''}">${ICON.map}<span><b>${t('tabItinerary')}</b></span></a>` : ''}</nav>` : ''}
-        ${PLAN && CTAB === 'home' ? `<div id="client-tab-body">${clientHomeHtml(c)}</div>` : PLAN && CTAB === 'itin' ? `<div id="client-tab-body">${clientItinHtml(c)}</div>` : `
+          ${PLAN && (PLAN.legs || []).length ? `<a href="#" data-ctab="itin" class="folder-tab ${CTAB === 'itin' ? 'on' : ''}">${ICON.map}<span><b>${t('tabItinerary')}</b></span></a>` : ''}
+          ${CELLAR ? `<a href="#" data-ctab="wines" class="folder-tab ${CTAB === 'wines' ? 'on' : ''}">${ICON.wine}<span><b>${t('tabWines')}</b></span></a>` : ''}</nav>` : ''}
+        ${PLAN && CTAB === 'home' ? `<div id="client-tab-body">${clientHomeHtml(c)}</div>` : PLAN && CTAB === 'itin' ? `<div id="client-tab-body">${clientItinHtml(c)}</div>`
+          : CELLAR && CTAB === 'wines' ? `<div id="client-tab-body">${wineListHtml(CELLAR, LANG)}</div>` : `
         ${signed ? `<div class="banner banner-ok">${ICON.check}<div><strong>${t('signedBanner')}</strong><br>
           <span>${t('signedOn')} ${fdatetime(c.client_signed_at)} ${t('by')} ${esc(c.client_signed_name)}</span></div></div>`
         : closed ? `<div class="banner banner-gold">${ICON.lock}<div><strong>${t('closedBanner')}</strong></div>
@@ -1605,7 +1642,7 @@
   const CAPTAIN_ONLY = ['close-charter', 'reopen', 'edit-charter', 'new-charter', 'send-report', 'notify-closed', 'inv-draft', 'inv-issue', 'master-sign', 'locked-edit', 'share-plan', 'vat-add', 'vat-del', 'vat-proof-del', 'vat-zip'];
   function applyRoleStyle() {
     let el = document.getElementById('role-style'); if (!el) { el = document.createElement('style'); el.id = 'role-style'; document.head.appendChild(el); }
-    const hide = ROLE === 'viewer' ? `[data-act]:not(${VIEW_OK.map(a => `[data-act="${a}"]`).join(',')}), .file-btn, [data-doc-upload], #f-plan input, #f-fal button, [data-share-itin], [data-live-always]`
+    const hide = ROLE === 'viewer' ? `[data-act]:not(${VIEW_OK.map(a => `[data-act="${a}"]`).join(',')}), .file-btn, [data-doc-upload], #f-plan input, #f-fal button, #f-wine, .w-qty button, [data-wdel], #w-share, [data-share-itin], [data-live-always]`
       : ROLE === 'crew' ? CAPTAIN_ONLY.map(a => `[data-act="${a}"]`).join(',') + ', [data-share-itin], [data-live-always]' : '';
     el.textContent = hide ? `body.admin-app :is(${hide}) { display: none !important; }` : '';
     document.body.classList.add('admin-app'); document.body.dataset.role = ROLE;
@@ -3224,10 +3261,101 @@
     finally { busy(b, false); }
   };
 
+  // ---------------- Wines/Spirits : carte des vins du client, tenue à jour par le capitaine ou la stew ----------------
+  // Stockée dans charter_documents (folder 'cellar', note = JSON { items, share_client, updated_at }) et lue par le client via client_cellar.
+  const cellarRow = c => (S.charter_documents || []).find(d => d.charter_id === c.id && d.folder === 'cellar');
+  const cellarOf = c => { const r = cellarRow(c); let p = null; try { p = r?.note ? JSON.parse(r.note) : null; } catch { p = null; }
+    return { share_client: true, items: [], ...(p || {}) }; };
+  let CELLAR_SAVE = null;
+  async function saveCellar(c, cel, quiet) {
+    cel.updated_at = new Date().toISOString();
+    const note = JSON.stringify(cel), r = cellarRow(c);
+    if (r) { await api.update('charter_documents', r.id, { note }); r.note = note; }
+    else await api.insert('charter_documents', { charter_id: c.id, folder: 'cellar', title: 'Wines/Spirits', note });
+    await reload(); notifyCharter(c.id);
+    if (!quiet) route();
+  }
+  function viewCellar(c) {
+    const cel = cellarOf(c), missing = (S._missing || []).includes('charter_documents');
+    const total = cel.items.reduce((a, i) => a + (toNum(i.qty) || 0), 0);
+    const sizeOpts = cur => Object.entries(CELLAR_SIZES).map(([k, l]) => `<option value="${k}" ${k === (cur || '75cl') ? 'selected' : ''}>${l}</option>`).join('');
+    const row = i => `<tr data-wid="${i.id}" class="${i.qty > 0 ? '' : 'row-cancelled'}">
+        <td data-label="Nom"><div><input class="w-in" data-f="name" value="${esc(i.name)}" aria-label="Nom"></div></td>
+        <td data-label="Année"><div><input class="w-in w-year" data-f="year" value="${esc(i.year || '')}" inputmode="numeric" placeholder="${i.cat === 'spirits' ? '—' : 'NV'}" aria-label="Millésime"></div></td>
+        <td data-label="Format"><div><select class="w-in" data-f="size" aria-label="Format">${sizeOpts(i.size)}</select></div></td>
+        <td data-label="Quantité"><div class="w-qty"><button class="icon-btn" data-wq="-1" aria-label="Une bouteille de moins">−</button>
+          <input class="w-in w-n" data-f="qty" type="number" min="0" value="${esc(i.qty ?? 0)}" aria-label="Quantité"><button class="icon-btn" data-wq="1" aria-label="Une bouteille de plus">+</button></div></td>
+        <td class="actions"><div class="row-gap" style="justify-content:flex-end"><button class="icon-btn danger" data-wdel title="Supprimer">${ICON.trash}</button></div></td></tr>`;
+    $('#app').innerHTML = shell('charters', `
+      <a class="back" href="#/charters">${ICON.back}Charters</a>
+      <div class="page-head">
+        <div><div class="eyebrow">${esc(c.yacht || YACHT)}</div><h1>${esc(c.title)}</h1>
+          <p class="muted">${esc(c.client_name || '')}${c.client_name ? ' · ' : ''}${fdate(c.start_date)} → ${fdate(c.end_date)} · ${statusBadge(c)}</p></div>
+      </div>
+      ${folderTabs(c, 'wines')}
+      ${missing ? `<div class="banner banner-gold">${ICON.lock}<div>Pour utiliser ce dossier, exécutez une fois le fichier <b>maj-dossiers.sql</b> dans Supabase (SQL Editor), puis rechargez la page.</div></div>` : ''}
+      <section class="panel">
+        <div class="panel-head"><h2>Ajouter une bouteille</h2>
+          <label class="check"><input type="checkbox" id="w-share" ${cel.share_client !== false ? 'checked' : ''}> <span>Visible par le client (onglet « Wines & Spirits »)</span></label></div>
+        <form id="f-wine" class="form-grid w-add">
+          <label class="field"><span>Rubrique</span><select name="cat">${CELLAR_CATS.map(([k, fr]) => `<option value="${k}">${fr}</option>`).join('')}</select></label>
+          <label class="field"><span>Nom du vin / champagne / spiritueux</span><input name="name" required placeholder="ex. Dom Pérignon" list="dl-wines"></label>
+          <label class="field"><span>Millésime</span><input name="year" inputmode="numeric" placeholder="ex. 2015 (vide = NV)"></label>
+          <label class="field"><span>Format</span><select name="size">${sizeOpts('75cl')}</select></label>
+          <label class="field"><span>Quantité</span><input name="qty" type="number" min="0" value="6" required></label>
+          <div class="w-add-btn"><button class="btn btn-primary" type="submit">${ICON.plus}Ajouter</button></div>
+        </form>
+        <datalist id="dl-wines">${[...new Set((S.charter_documents || []).filter(d => d.folder === 'cellar').flatMap(d => { try { return JSON.parse(d.note).items.map(i => i.name); } catch { return []; } }))].sort().map(n => `<option value="${esc(n)}">`).join('')}</datalist>
+        <p class="muted small">Le client voit la carte en direct dans son lien, avec les quantités restantes. Utilisez − et + au fil du charter : chaque changement est enregistré tout de suite. ${total ? `<b>${total} bouteille${total > 1 ? 's' : ''}</b> à bord.` : ''}</p>
+      </section>
+      ${CELLAR_CATS.map(([k, fr]) => { const items = cel.items.filter(i => i.cat === k).sort((a, b) => String(a.name).localeCompare(String(b.name)));
+        return items.length ? `<section class="panel"><div class="panel-head"><h2>${fr}</h2><span class="muted small">${items.reduce((a, i) => a + (toNum(i.qty) || 0), 0)} bout.</span></div>
+          <div class="table-wrap"><table class="table table-cards table-compact w-table"><thead><tr><th>Nom</th><th>Année</th><th>Format</th><th>Quantité</th><th></th></tr></thead>
+          <tbody>${items.map(row).join('')}</tbody></table></div></section>` : ''; }).join('')}
+      ${cel.items.length ? '' : '<div class="empty-state card"><p class="muted">Aucune bouteille. Ajoutez la cave du client : champagnes, blancs, rosés, rouges, spiritueux.</p></div>'}`);
+
+    const f = $('#f-wine');
+    f.addEventListener('submit', async e => {
+      e.preventDefault(); if (!f.reportValidity()) return; const btn = $('button[type=submit]', f); busy(btn, true);
+      const d = Object.fromEntries(new FormData(f)), cur = cellarOf(c);
+      cur.items.push({ id: uuid(), cat: d.cat, name: d.name.trim(), year: d.year.trim(), size: d.size, qty: Math.max(0, toNum(d.qty) || 0) });
+      try { await saveCellar(c, cur); toast('Ajouté à la carte'); const nf = $('#f-wine'); if (nf) { nf.cat.value = d.cat; nf.name.focus(); } }
+      catch (err) { toast(errMsg(err), 'err'); busy(btn, false); }
+    });
+    $('#w-share').addEventListener('change', async e => { const cur = cellarOf(c); cur.share_client = e.target.checked;
+      try { await saveCellar(c, cur); toast(e.target.checked ? 'Carte visible par le client' : 'Carte masquée pour le client'); } catch (err) { toast(errMsg(err), 'err'); } });
+    // Modifications en ligne : enregistrement différé (le temps de taper), − / + immédiats
+    const commit = (id, patch, delay) => {
+      const cur = cellarOf(c), it = cur.items.find(i => i.id === id); if (!it) return;
+      Object.assign(it, patch); const r = cellarRow(c); if (r) r.note = JSON.stringify(cur);
+      clearTimeout(CELLAR_SAVE);
+      CELLAR_SAVE = setTimeout(async () => { try { await saveCellar(c, cellarOf(c), true); } catch (err) { toast(errMsg(err), 'err'); } }, delay);
+    };
+    $$('.w-table tbody tr').forEach(tr => {
+      const id = tr.dataset.wid;
+      $$('.w-in', tr).forEach(inp => inp.addEventListener(inp.tagName === 'SELECT' ? 'change' : 'input', () => {
+        const v = inp.dataset.f === 'qty' ? Math.max(0, toNum(inp.value) || 0) : inp.value.trim();
+        if (inp.dataset.f === 'qty') tr.classList.toggle('row-cancelled', !(v > 0));
+        commit(id, { [inp.dataset.f]: v }, 700);
+      }));
+      $$('[data-wq]', tr).forEach(b => b.addEventListener('click', () => {
+        const n = $('.w-n', tr), v = Math.max(0, (toNum(n.value) || 0) + +b.dataset.wq); n.value = v;
+        tr.classList.toggle('row-cancelled', !(v > 0)); commit(id, { qty: v }, 400);
+      }));
+      $('[data-wdel]', tr).addEventListener('click', async () => {
+        const cur = cellarOf(c), it = cur.items.find(i => i.id === id);
+        if (!it || !(await confirmDialog(`Retirer « ${esc(it.name)} » de la carte ?`, 'Retirer'))) return;
+        cur.items = cur.items.filter(i => i.id !== id);
+        try { await saveCellar(c, cur); toast('Retiré de la carte'); } catch (err) { toast(errMsg(err), 'err'); }
+      });
+    });
+  }
+
   // ---------------- Dossiers Preference list / Itinerary ----------------
   function viewCharterFolder(c, tab) {
     if (tab === 'day') return viewDayProgram(c);
     if (tab === 'guests') return viewGuestList(c);
+    if (tab === 'wines') return viewCellar(c);
     const [, label, sub] = FOLDERS.find(f => f[0] === tab);
     const docs = (S.charter_documents || []).filter(d => d.charter_id === c.id && d.folder === tab)
       .sort((a, b) => String(b.created_at || '').localeCompare(String(a.created_at || '')));
@@ -4134,13 +4262,13 @@
 
   // ---------------- Détail d'un charter ----------------
   let CURRENT = null;
-  const FOLDERS = [['apa', 'APA', 'Comptabilité'], ['day', 'Programme du jour', 'Jour par jour, repas'], ['guests', 'Guest List', 'Passeports, FAL 6'], ['preferences', 'Preference list', 'Préférences des invités'], ['itinerary', 'Itinerary', 'Itinéraire']];
+  const FOLDERS = [['apa', 'APA', 'Comptabilité'], ['day', 'Programme du jour', 'Jour par jour, repas'], ['guests', 'Guest List', 'Passeports, FAL 6'], ['wines', 'Wines/Spirits', 'Carte des vins'], ['preferences', 'Preference list', 'Préférences des invités'], ['itinerary', 'Itinerary', 'Itinéraire']];
   function folderTabs(c, tab) {
     const n = f => (S.charter_documents || []).filter(d => d.charter_id === c.id && d.folder === f).length;
     return `<nav class="folder-tabs no-print">${FOLDERS.map(([k, l, sub]) => {
-      const cnt = k === 'apa' ? S.expenses.filter(e => e.charter_id === c.id).length : k === 'day' ? 0 : n(k);
+      const cnt = k === 'apa' ? S.expenses.filter(e => e.charter_id === c.id).length : k === 'day' ? 0 : k === 'wines' ? cellarOf(c).items.length : n(k);
       return `<a href="#/charter/${c.id}${k === 'apa' ? '' : '/' + k}" class="folder-tab ${tab === k ? 'on' : ''}">${ICON.folder}
-        <span><b>${l}</b><small><span class="ft-sub">${sub}</span>${cnt ? `<span class="ft-sub"> · </span>${cnt} ${k === 'apa' ? 'dép.' : k === 'guests' ? 'pass.' : 'élém.'}` : ''}</small></span></a>`; }).join('')}</nav>`;
+        <span><b>${l}</b><small><span class="ft-sub">${sub}</span>${cnt ? `<span class="ft-sub"> · </span>${cnt} ${k === 'apa' ? 'dép.' : k === 'guests' ? 'pass.' : k === 'wines' ? 'réf.' : 'élém.'}` : ''}</small></span></a>`; }).join('')}</nav>`;
   }
   function viewCharter(id, tab = 'apa') {
     const c = charterById(id);

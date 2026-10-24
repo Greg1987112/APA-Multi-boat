@@ -1289,6 +1289,7 @@
           if (ds.length && td <= ds[ds.length - 1] && dayDiff(ds[0], td) <= 7) CTAB = 'home';
           else { const saved = store.get('ca-tab-' + token); if (saved && saved !== 'home' && (saved !== 'itin' || PLAN) && (saved !== 'wines' || CELLAR)) CTAB = saved; } }
         if (CTAB === 'wines' && !CELLAR) CTAB = 'accounts';
+        if (B && !REPORT && !refresh.offered) { refresh.offered = true; setTimeout(() => offerInstall(LANG), 2500); }
         if (CTAB === 'itin' && !(PLAN && (PLAN.legs || []).length)) CTAB = 'accounts';
         if (CTAB === 'home' && !PLAN) CTAB = 'accounts';
         const quiet = CTAB !== 'accounts' && $('#client-tab-body');
@@ -1444,6 +1445,7 @@
       if (!B) return renderError(REPORT ? t('reportUnavailable') : t('invalidLinkHelp'));
       const c = B.charter, st = computeStatement(B), signed = c.status === 'signed', closed = c.status === 'closed';
       document.title = `${c.title} — ${c.yacht || YACHT}`;
+      document.querySelector('meta[name="apple-mobile-web-app-title"]')?.setAttribute('content', c.yacht || YACHT); // nom sous l'icône
       $('#app').innerHTML = `
       <header class="topbar topbar-client">
         <div class="topbar-inner">
@@ -1675,6 +1677,7 @@
     if (isCaptain() && profileIncomplete() && !store.get('welcome-' + BOAT.id)) { store.set('welcome-' + BOAT.id, '1'); location.hash = '#/settings'; }
     route();
     if (canEdit() && store.get('share-pos') === '1') posStart(true); // reprend le partage de position
+    setTimeout(() => offerInstall('fr'), 1500);
   }
   ACTIONS_LATE.push(() => {
     ACTIONS['boat-switch'] = async b => { store.set('boat-id', b.value || b.dataset.id); location.hash = '#/charters'; await runAdmin(); };
@@ -1799,6 +1802,7 @@
   const ACTIONS = {};
   ACTIONS_LATE.forEach(f => f());
   ACTIONS['pos-toggle'] = () => posModal();
+  ACTIONS['install-guide'] = () => { if (INSTALL_EVT) { INSTALL_EVT.prompt(); INSTALL_EVT = null; } else installGuide('fr'); };
   document.addEventListener('click', e => {
     const b = e.target.closest('[data-act]');
     if (!b || !ACTIONS[b.dataset.act] || IS_CLIENT) return;
@@ -2023,6 +2027,9 @@
         <form id="f-pw" class="form-grid"><label class="field"><span>Nouveau mot de passe</span><input name="pw" type="password" minlength="8" autocomplete="new-password" required></label>
           <div class="field" style="align-self:end"><button class="btn btn-primary" type="submit">Enregistrer</button></div></form>
         <p class="muted small">Utile après une première connexion par lien e-mail.</p></section>
+      <section class="panel"><div class="panel-head"><h2>App sur votre téléphone</h2></div>
+        <p class="muted small">${isStandalone() ? 'L’app est installée sur cet appareil.' : 'Installez l’app sur l’écran d’accueil de votre iPhone ou Android : une icône, en plein écran, comme une application.'}</p>
+        ${isStandalone() ? '' : `<button class="btn btn-ghost" data-act="install-guide">${ICON.plus}Installer l’app sur ce téléphone</button>`}</section>
       <div class="row-gap"><button class="btn btn-ghost" data-act="logout">${ICON.logout}Se déconnecter</button></div>`);
     $('#f-pw').addEventListener('submit', async e => { e.preventDefault(); const btn = $('button', e.target); busy(btn, true);
       try { await api.setPassword(e.target.pw.value); toast('Mot de passe enregistré'); e.target.reset(); } catch (err) { toast(errMsg(err), 'err'); } busy(btn, false); });
@@ -5097,6 +5104,61 @@ ${yacht}`;
   }
   ACTIONS['new-voyage'] = () => voyageForm();
   ACTIONS['edit-voyage'] = b => voyageForm(S.voyages.find(x => x.id === b.dataset.id));
+
+  // ------------------------------------------------------------------
+  //  Installation sur l'écran d'accueil (web app) : bandeau discret + guide illustré
+  // ------------------------------------------------------------------
+  const isStandalone = () => window.matchMedia?.('(display-mode: standalone)').matches || navigator.standalone === true;
+  const IS_ANDROID = /Android/i.test(navigator.userAgent);
+  const IS_MOBILE = IS_IOS || IS_ANDROID;
+  let INSTALL_EVT = null;
+  window.addEventListener('beforeinstallprompt', e => { e.preventDefault(); INSTALL_EVT = e; });
+  window.addEventListener('appinstalled', () => { $('#install-card')?.remove(); INSTALL_EVT = null; });
+  const INSTALL_TX = {
+    fr: { title: 'Installer l’app sur votre téléphone', sub: 'Une icône sur l’écran d’accueil, en plein écran, en un geste.', how: 'Comment faire', later: 'Plus tard', install: 'Installer',
+      s1: 'Touchez le bouton <b>Partager</b>', s1b: 'en bas de Safari (en haut sur iPad)', s2: 'Choisissez <b>Sur l’écran d’accueil</b>', s2b: 'faites défiler la liste si besoin',
+      s3: 'Touchez <b>Ajouter</b>', s3b: 'l’icône apparaît sur votre écran d’accueil', safari: 'Sur iPhone, ouvrez ce lien dans <b>Safari</b> pour pouvoir l’installer.',
+      android: 'Menu <b>⋮</b> de Chrome, puis <b>Installer l’application</b> (ou <b>Ajouter à l’écran d’accueil</b>).', ok: 'Compris' },
+    en: { title: 'Install the app on your phone', sub: 'An icon on your home screen, full screen, in one tap.', how: 'How to', later: 'Later', install: 'Install',
+      s1: 'Tap the <b>Share</b> button', s1b: 'at the bottom of Safari (top on iPad)', s2: 'Choose <b>Add to Home Screen</b>', s2b: 'scroll down the list if needed',
+      s3: 'Tap <b>Add</b>', s3b: 'the icon appears on your home screen', safari: 'On iPhone, open this link in <b>Safari</b> to install it.',
+      android: 'Chrome menu <b>⋮</b>, then <b>Install app</b> (or <b>Add to Home screen</b>).', ok: 'Got it' },
+  };
+  const SHARE_ICO = '<svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3v12M8 7l4-4 4 4"/><path d="M6 11H5a1 1 0 0 0-1 1v8a1 1 0 0 0 1 1h14a1 1 0 0 0 1-1v-8a1 1 0 0 0-1-1h-1"/></svg>';
+  const ADDHOME_ICO = '<svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><rect x="4" y="4" width="16" height="16" rx="4"/><path d="M12 8v8M8 12h8"/></svg>';
+  function installGuide(lang = 'fr') {
+    const T = INSTALL_TX[lang] || INSTALL_TX.fr;
+    const otherIosBrowser = IS_IOS && /CriOS|FxiOS|EdgiOS|OPiOS/.test(navigator.userAgent);
+    const body = IS_ANDROID && !IS_IOS ? `<p>${T.android}</p>`
+      : `${otherIosBrowser ? `<div class="banner banner-gold small">${T.safari}</div>` : ''}
+        <ol class="install-steps">
+          <li><span class="is-ico">${SHARE_ICO}</span><div>${T.s1}<small>${T.s1b}</small></div></li>
+          <li><span class="is-ico">${ADDHOME_ICO}</span><div>${T.s2}<small>${T.s2b}</small></div></li>
+          <li><span class="is-ico is-add">${lang === 'fr' ? 'Ajouter' : 'Add'}</span><div>${T.s3}<small>${T.s3b}</small></div></li>
+        </ol>`;
+    const m = openModal({ title: T.title, body, footer: `<button class="btn btn-primary" data-close>${T.ok}</button>` });
+    return m;
+  }
+  // Bandeau proposé une fois (puis à nouveau 30 jours après « Plus tard »), seulement sur téléphone et hors app installée
+  function offerInstall(lang = 'fr', force = false) {
+    if (isStandalone() || $('#install-card')) return;
+    if (!force) {
+      if (!IS_MOBILE) return;
+      const last = +(store.get('ca-install-later') || 0); if (Date.now() - last < 30 * 864e5) return;
+    }
+    const T = INSTALL_TX[lang] || INSTALL_TX.fr;
+    const el = document.createElement('div'); el.id = 'install-card'; el.className = 'install-card no-print';
+    el.innerHTML = `<img src="icons/icon-192.png" alt="" width="44" height="44"><div class="ic-txt"><b>${T.title}</b><small>${T.sub}</small></div>
+      <div class="ic-btns"><button class="btn btn-ghost btn-sm" data-ic="later">${T.later}</button>
+      <button class="btn btn-primary btn-sm" data-ic="go">${INSTALL_EVT ? T.install : T.how}</button></div>`;
+    document.body.appendChild(el);
+    el.addEventListener('click', async e => {
+      const b = e.target.closest('[data-ic]'); if (!b) return;
+      if (b.dataset.ic === 'later') { store.set('ca-install-later', String(Date.now())); el.remove(); return; }
+      if (INSTALL_EVT) { INSTALL_EVT.prompt(); const r = await INSTALL_EVT.userChoice.catch(() => null); if (r?.outcome === 'accepted') el.remove(); INSTALL_EVT = null; return; }
+      installGuide(lang);
+    });
+  }
 
   // ==================================================================
   //  Démarrage
